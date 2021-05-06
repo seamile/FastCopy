@@ -70,7 +70,7 @@ class Receiver:
         sock.connect(self.addr)
         return sock
 
-    def whole_recv(self, length: int) -> bytes:
+    def recv_all(self, length: int) -> bytearray:
         '''接收指定长度的完整数据'''
         buffer = bytearray(length)
         self.sock.recv_into(buffer, length, MSG_WAITALL)
@@ -78,17 +78,17 @@ class Receiver:
 
     def recv_pkg(self, retry: int = 5) -> tuple:
         for i in range(retry):
-            seq = self.whole_recv(4)  # 序号 4 字节
+            seq = self.recv_all(4)  # 序号 4 字节
             if seq == PKG_END:
                 return
             else:
-                chksum = self.whole_recv(4)  # 校验和 4 字节
+                chksum = self.recv_all(4)  # 校验和 4 字节
                 chksum = int.from_bytes(chksum, 'big')
 
-                length = self.whole_recv(2)  # 长度占 2 字节
+                length = self.recv_all(2)  # 长度占 2 字节
                 length = int.from_bytes(length, 'big')
 
-                chunk = self.whole_recv(length)
+                chunk = self.recv_all(length)
 
                 if crc32(chunk) != chksum:
                     # 数据包错误，则要求服务器重传 (TODO：按照错误包格式封包)

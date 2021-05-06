@@ -1,39 +1,11 @@
 #!/usr/bin/env python
 
-import os
 import socket
-from zlib import crc32
 from queue import Queue, Empty
 from threading import Thread, Event
 
-from packages import PKG_OK, PKG_END, CHUNK_SIZE
-
-
-class Reader(Thread):
-    def __init__(self, file_path: str, qsize: int):
-        super().__init__()
-        self.daemon = True
-        self.file_path = file_path
-        self.file_q = Queue(qsize)
-        self.done = Event()
-
-    def run(self):
-        if not os.path.isfile(self.file_path):
-            raise FileNotFoundError(f'File `{self.file_path}` not found')
-        else:
-            num = 0
-            with open(self.file_path, 'rb') as fp:
-                while chunk := fp.read(CHUNK_SIZE):           # 读取单位长度的数据，如果为空则跳出循环
-                    seq = num.to_bytes(4, 'big')              # 序号 4 字节
-                    chksum = crc32(chunk).to_bytes(4, 'big')  # 校验和 4 字节
-                    length = len(chunk).to_bytes(2, 'big')    # 长度占 2 字节
-                    pkg = seq + chksum + length + chunk       # 组装完整数据包
-                    self.file_q.put(pkg)                      # 写入队列
-                    num += 1
-                else:
-                    self.file_q.put(PKG_END)  # 文件读完，Head 全部写 1
-            self.file_q.join()
-            self.done.set()
+from packages import PKG_OK
+from sender import Reader
 
 
 class Worker(Thread):

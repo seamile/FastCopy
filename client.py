@@ -38,7 +38,7 @@ def base(host, port):
             fp.write(data)
 
 
-def main(src, dst):
+def main(src, dst, n_thread):
     pass
 
 
