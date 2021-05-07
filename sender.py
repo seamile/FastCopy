@@ -4,25 +4,20 @@ from threading import Thread
 from queue import Queue
 
 from packages import PKG_END, CHUNK_SIZE
+# from utils import pack_file_info
 
 
 class Reader(Thread):
+
     def __init__(self, dst_path: str, qsize: int):
         super().__init__(daemon=True)
 
         self.dst_path = dst_path
         self.file_q = Queue(qsize)
-
-        # e.g.
-        # self.files = {
-        #   1: ["./foo/bar/example.txt", 271, 123, 123, 123],  # 依次为：路径，大小，创建时间、修改时间、访问时间
-        #   2: ["./other/music.mp3", 82379]
-        #   3: [...]
-        # }
         self.files = {}
 
     def file_extra_info(self, path):
-        pass
+        '''获取文件附加信息: 大小、权限、'''
 
     def set_files(self):
         if os.path.isfile(self.dst_path):
@@ -33,7 +28,7 @@ class Reader(Thread):
                 for filename in filenames:
                     path = os.path.join(base_dir, filename)
                     size = os.path.getsize(path)
-
+                    print(size)
         else:
             raise FileNotFoundError
 

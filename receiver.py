@@ -8,56 +8,14 @@ TODO:
 - [ ] 网络部分的处理
 '''
 
-import os
+# import os
 from socket import socket, MSG_WAITALL
 from binascii import crc32
-from queue import Queue
-from threading import Thread
-from math import ceil
+# from queue import Queue
+# from threading import Thread
+# from math import ceil
 
-from packages import PKG_BAD, PKG_END, CHUNK_SIZE
-
-
-class Writer(Thread):
-    '''单文件写入线程'''
-
-    def __init__(self, file_path: str, file_size: int) -> None:
-        '''
-        @file_path: 文件路径
-        @file_size: 文件大小
-        '''
-        super().__init__()
-        self.daemon = True
-
-        self.file_path = file_path
-        self.file_size = file_size
-        self.chunk_q = Queue()
-        self.n_chunks = ceil(file_size / CHUNK_SIZE)
-
-    @staticmethod
-    def make_empty_file(file_path: str, file_size: int):
-        block_size = 1024 * 1024  # 一次写入的块大小，默认为 1Mb
-        count, remain = divmod(file_size, block_size)
-        with open('/dev/zero', 'rb') as src_fp, open(file_path, 'wb') as dst_fp:
-            for i in range(count):
-                dst_fp.write(src_fp.read(block_size))
-            if remain > 0:
-                dst_fp.write(src_fp.read(remain))
-
-    def write_chunk(self, seq: int, chunk: bytes):
-        with open(self.file_path, 'rb+') as fp:
-            position = seq * CHUNK_SIZE
-            fp.seek(position)
-            fp.write(chunk)
-
-    def run(self):
-        # 创建空文件
-        if not os.path.isfile(self.file_path):
-            self.make_empty_file(self.file_path, self.file_size)
-
-        while self.n_chunks > 0:
-            seq, chunk = self.chunk_q.get()
-            self.write_chunk(seq, chunk)
+from const import PKG_BAD, PKG_END
 
 
 class Receiver:
