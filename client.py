@@ -19,25 +19,6 @@ class Client:
         fst_sock.send()
 
 
-def base(host, port):
-    sock = ...  # connect(host, port)
-    packages = {}
-
-    while True:
-        seq = sock.recv(4)
-        if seq != b'\xff\xff\xff\xff':
-            data = sock.recv(512)
-            seq = int.from_bytes(seq, 'big')
-            packages[seq] = data
-        else:
-            break
-
-    with open('rr', 'wb') as fp:
-        for seq in sorted(packages.keys()):
-            data = packages[seq]
-            fp.write(data)
-
-
 def main(src, dst, n_thread):
     pass
 

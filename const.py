@@ -5,3 +5,5 @@ PKG_END = b'\xff\xff\xff\xff'
 
 PULL = b''
 PUSH = b''
+
+TIMEOUT = 30  # 全局超时时间

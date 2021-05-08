@@ -125,6 +125,9 @@ class Writer(Thread):
             if remain > 0:
                 dst_fp.write(src_fp.read(remain))
 
+    def make_all_files(self, remove_exist=False):
+        pass
+
     def write_chunk(self, seq: int, chunk: bytes):
         with open(self.file_path, 'rb+') as fp:
             position = seq * CHUNK_SIZE
