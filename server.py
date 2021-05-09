@@ -1,62 +1,48 @@
 #!/usr/bin/env python
 
 import socket
-from queue import Queue, Empty
-from threading import Thread, Event
+# from queue import Queue, Empty
+from threading import Thread
 
-from const import PKG_OK
+import const
+from const import Ptype
+from network import NetworkMixin
 
 
-class Worker(Thread):
-    def __init__(self, father: 'Server', cli_sock: socket.socket, cli_addr: tuple,
-                 data_q: Queue, done: Event):
+class Worker(Thread, NetworkMixin):
+    def __init__(self, sock, addr):
         super().__init__(daemon=True)
-        self.father = father
-        self.cli_sock = cli_sock
-        self.cli_addr = cli_addr
-        self.data_q = data_q
-        self.done = done
+        self.sock = sock
+        self.addr = addr
 
-    def run(self):
-        print('Worker 启动')
+    def gen_session_id(self) -> int:
+        pass
 
-        while not self.done.is_set():
-            try:
-                package = self.data_q.get(timeout=1)
-            except Empty:
-                print('empty')
-                pass
-            else:
-                self.cli_sock.send(package)
-                result = self.cli_sock.recv(1)
-                if result != PKG_OK:
-                    print('re-send')
-                    continue
-                else:
-                    print(b'send: %s' % package[:4])
-                self.data_q.task_done()
-
-
-class Server(Thread):
-    def __init__(self, host: str, port: int):
-        super().__init__(name='TCPServerThread', daemon=True)
-        self.addr = (host, port)
-        self.sock = None
-        self.clients = {}
-        self.workers = []
+    def create_session(self):
+        session_id = self.gen_session_id()
+        print(session_id)
 
     def run(self) -> None:
-        # init socket
-        self.sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
+        ptype = self.recv_all(const.LEN_TYPE)
+        if ptype == Ptype.PULL:
+            pass
+        elif ptype == Ptype.PUSH:
+            pass
+        elif ptype == Ptype.FOLLOWER:
+            pass
+        else:
+            pass
 
-        while True:
-            cli_sock, cli_addr = self.sock.accept()
-            worker = Worker(self, cli_sock, cli_addr)
-            worker.start()
 
+def main(host: str = '0.0.0.0', port: int = 7323, backlog: int = 2048):
+    addr = (host, port)
+    sock = socket.create_server(addr, backlog=backlog, reuse_port=True)
+    sock.settimeout(const.TIMEOUT)
 
-def main():
-    pass
+    while True:
+        cli_sock, cli_addr = sock.accept()
+        worker = Worker(cli_sock, cli_addr)
+        worker.start()
 
 
 if __name__ == '__main__':

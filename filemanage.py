@@ -5,7 +5,7 @@ from queue import Queue
 from struct import pack, unpack
 from threading import Thread
 
-from const import CHUNK_SIZE, PKG_END
+from const import CHUNK_SIZE
 
 
 FileInfo = namedtuple(
@@ -94,7 +94,8 @@ class Reader(Thread):
                     self.file_q.put(pkg)                      # 写入队列
                     seq += 1
                 else:
-                    self.file_q.put(PKG_END)  # 文件读完，Head 全部写 1
+                    # TODO: 文件读完, 通知
+                    pass
             self.file_q.join()
             self.done.set()
 

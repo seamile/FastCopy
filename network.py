@@ -1,11 +1,11 @@
 import socket
 from binascii import crc32
 from struct import pack, unpack
-from const import PKG_BAD
+from typing import Tuple
 
 
-class Network:
-    def connect(self, server_addr: tuple):
+class NetworkMixin:
+    def connect(self, server_addr: Tuple[str, int]):
         '''建立连接'''
         self.sock = socket.create_connection(server_addr, timeout=30)
 
@@ -30,6 +30,6 @@ class Network:
 
         # TODO: 报文错误，需重传
         if crc32(datagram) != chksum:
-            self.sock.send(PKG_BAD)
+            pass
 
         return ptype, chksum, length, datagram
