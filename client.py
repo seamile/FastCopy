@@ -19,7 +19,7 @@ class Client:
         fst_sock.send()
 
 
-def main(src, dst, n_thread):
+def main(src, dst):
     pass
 
 

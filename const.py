@@ -1,8 +1,9 @@
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 30  # 全局超时时间
 
+LEN_HEAD = 7
 LEN_TYPE = 1
 LEN_CHKSUM = 4
 LEN_LENGTH = 2
@@ -18,3 +19,8 @@ class Ptype(IntEnum):
     FILE_READY = 0x07  # 文件就绪
     TRANSFER = 0x08  # 数据传输
     ERROR = 0x09  # 错误回传
+
+
+class Role(Enum):
+    Sender = 1
+    Receiver = 2

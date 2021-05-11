@@ -4,14 +4,12 @@ from math import ceil
 from queue import Queue
 from struct import pack, unpack
 from threading import Thread
+from typing import Dict
 
 from const import CHUNK_SIZE
 
 
-FileInfo = namedtuple(
-    'FileInfo',
-    field_names=['file_id', 'perm', 'size', 'ctime', 'mtime', 'atime', 'path']
-)
+FileInfo = namedtuple('FileInfo', ['file_id', 'perm', 'size', 'ctime', 'mtime', 'atime', 'path'])
 
 
 class Reader(Thread):
@@ -20,9 +18,9 @@ class Reader(Thread):
         super().__init__(daemon=True)
 
         self.dst_path = dst_path
-        self.files = {}
-        self.file_info_q = Queue(qsize)
-        self.file_chunk_q = Queue(qsize)
+        self.files: Dict[int, str] = {}
+        self.file_info_q: Queue = Queue(qsize)
+        self.file_chunk_q: Queue = Queue(qsize)
 
     def all_files(self):
         file_id = 0
@@ -113,7 +111,7 @@ class Writer(Thread):
 
         self.file_path = file_path
         self.file_size = file_size
-        self.chunk_q = Queue()
+        self.chunk_q: Queue = Queue()
         self.n_chunks = ceil(file_size / CHUNK_SIZE)
 
     @staticmethod
