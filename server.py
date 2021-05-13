@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import const
 from const import Ptype, Role
+from filemanage import Reader, Writer
 from network import NetworkMixin
 
 
@@ -16,17 +17,25 @@ class Session:
         self.id = session_id
         self.role = role
         self.dest_path = dest_path
-        self.send_q: Queue[bytes] = Queue()
-        self.recv_q: Queue[bytes] = Queue()
+
+        self.send_q: Queue[bytes] = Queue(const.QUEUE_SIZE)
+        self.recv_q: Queue[bytes] = Queue(const.QUEUE_SIZE)
         self.clients: List[socket.socket] = []
 
     def attach(self, sock: socket.socket):
         self.clients.append(sock)
 
     def launch_reader(self):
-        pass
+        '''启动 Reader'''
+        self.file_man = Reader(self.dest_path)
+        self.file_man.start()
 
-    def launch_sender(self):
+    def launch_writer(self):
+        '''启动 Writer'''
+        self.file_man = Writer()
+        self.file_man.start()
+
+    def launch_worker(self, worker: 'Worker'):
         pass
 
     def run_as_sender(self):
@@ -86,20 +95,27 @@ class Worker(Thread, NetworkMixin):
         s_manager = SessionManager()
         ptype, *_, datagram = self.recv_msg()
 
-        if ptype == Ptype.PULL:
+        if ptype == Ptype.PUSH:
+            # 服务端作为发送端运行
+            dest_path = datagram.decode('utf8')
+            session = s_manager.new_session(Role.Sender, dest_path)
+            session.attach(self.sock)
+            while True:
+                ptype, payload = session.file_man.output_q.get()
+                self.send_msg(ptype, payload)
+
+        elif ptype == Ptype.PULL:
+            # 服务端作为接收端运行
             dest_path = datagram.decode('utf8')
             session = s_manager.new_session(Role.Receiver, dest_path)
             session.attach(self.sock)
 
-        elif ptype == Ptype.PUSH:
-            dest_path = datagram.decode('utf8')
-            session = s_manager.new_session(Role.Sender, dest_path)
-            session.attach(self.sock)
-
         elif ptype == Ptype.FOLLOWER:
+            # 将后续连接加入对应会话
             session_id = unpack('>H', datagram)[0]
             session = s_manager.get_session(session_id)
             session.attach(self.sock)
+            session.launch_worker(self)
 
         else:
             raise TypeError('连接报文类型错误')
@@ -108,7 +124,6 @@ class Worker(Thread, NetworkMixin):
 def main(host: str = '0.0.0.0', port: int = 7323, backlog: int = 2048):
     addr = (host, port)
     sock = socket.create_server(addr, backlog=backlog, reuse_port=True)
-    sock.settimeout(const.TIMEOUT)
 
     while True:
         cli_sock, cli_addr = sock.accept()

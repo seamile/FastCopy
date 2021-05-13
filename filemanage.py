@@ -4,9 +4,9 @@ from math import ceil
 from queue import Queue
 from struct import pack, unpack
 from threading import Thread
-from typing import Dict
+from typing import Dict, Tuple
 
-from const import CHUNK_SIZE
+from const import CHUNK_SIZE, QUEUE_SIZE, EOF, Ptype
 
 
 FileInfo = namedtuple('FileInfo', ['file_id', 'perm', 'size', 'ctime', 'mtime', 'atime', 'path'])
@@ -14,24 +14,45 @@ FileInfo = namedtuple('FileInfo', ['file_id', 'perm', 'size', 'ctime', 'mtime', 
 
 class Reader(Thread):
 
-    def __init__(self, dst_path: str, qsize: int):
+    def __init__(self, dst_path: str):
         super().__init__(daemon=True)
 
-        self.dst_path = dst_path
+        if os.path.exists(dst_path):
+            self.dst_path = dst_path
+        else:
+            raise FileNotFoundError(dst_path)
+
+        self.base_path = ''
+        self.n_files = 0
         self.files: Dict[int, str] = {}
-        self.file_info_q: Queue = Queue(qsize)
-        self.file_chunk_q: Queue = Queue(qsize)
+        self.input_q: Queue[int] = Queue()
+        self.output_q: Queue[Tuple[Ptype, bytearray]] = Queue(QUEUE_SIZE)
 
-    def all_files(self):
-        file_id = 0
-        for directory, _, filenames in os.walk(self.dst_path):
-            for filename in filenames:
-                filepath = os.path.join(directory, filename)
-                self.files[file_id] = filepath
-                file_id += 1
+    def prepare_all_files(self):
+        '''整理要传输的文件列表'''
+        file_id = 0  # 文件初始 ID 为 0
 
-    @staticmethod
-    def pack_file_info(file_id, filepath, basepath):
+        if os.path.isdir(self.dst_path):
+            self.base_path = self.dst_path
+            for directory, _, filenames in os.walk(self.dst_path):
+                for filename in filenames:
+                    self.files[file_id] = os.path.join(directory, filename)
+                    file_id += 1
+            self.n_files = file_id + 1
+
+        elif os.path.isfile(self.dst_path):
+            self.base_path = os.path.dirname(self.dst_path)
+            self.files[file_id] = self.dst_path
+            self.n_files = 1
+
+        else:
+            raise TypeError(f'The dest file `{self.dst_path}` is not a regular file.')
+
+    def pack_file_count(self) -> Tuple[Ptype, bytes]:
+        '''封装文件总量信息'''
+        return Ptype.FILE_COUNT, pack('>H', self.n_files)
+
+    def pack_file_info(self, file_id, filepath) -> Tuple[Ptype, bytes]:
         '''
         封装文件信息报文
 
@@ -45,22 +66,9 @@ class Reader(Thread):
         ctime = stat.st_ctime  # 创建时间, 8 Bytes
         mtime = stat.st_mtime  # 修改时间, 8 Bytes
         atime = stat.st_atime  # 访问时间, 8 Bytes
-        path = os.path.relpath(filepath, basepath).encode('utf8')  # 相对路径
+        path = os.path.relpath(filepath, self.base_path).encode('utf8')  # 相对路径
         fmt = f'>2HQ3d{len(path)}s'
-        return pack(fmt, file_id, perm, size, ctime, mtime, atime, path)
-
-    def set_files(self):
-        if os.path.isfile(self.dst_path):
-            relative_path = os.path.basename(self.dst_path)
-            self.files = {1: [relative_path, os.path.getsize(self.dst_path)]}
-        elif os.path.isdir(self.dst_path):
-            for base_dir, _, filenames in os.walk(self.dst_path):
-                for filename in filenames:
-                    path = os.path.join(base_dir, filename)
-                    size = os.path.getsize(path)
-                    print(size)
-        else:
-            raise FileNotFoundError
+        return Ptype.FILE_INFO, pack(fmt, file_id, perm, size, ctime, mtime, atime, path)
 
     def read_chunk(self, file_id: int, seq: int):
         filepath = self.files[file_id]
@@ -69,7 +77,7 @@ class Reader(Thread):
             fp.seek(position)
             return fp.read(CHUNK_SIZE)
 
-    def pack_file_chunk(self, file_id: int, seq: int, chunk: bytes):
+    def pack_file_chunks(self, file_id: int):
         '''
         封装文件数据块报文
 
@@ -77,29 +85,40 @@ class Reader(Thread):
             | :-----: | :---: | :---: |
             |   2B    |  4B   |  ...  |
         '''
-        length = len(chunk)
-        fmt = f'>HI{length}s'
-        return pack(fmt, file_id, seq, chunk)
+        seq = 0
+        with open(self.files[file_id], 'rb') as fp:
+            while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
+                length = len(chunk)
+                fmt = f'>HI{length}s'
+                yield Ptype.FILE_CHUNK, pack(fmt, file_id, seq, chunk)
+                seq += 1
+            else:
+                yield Ptype.FILE_CHUNK, pack('>HI', file_id, EOF)
 
     def run(self):
-        if os.path.isdir(self.dst_path):
-            raise FileNotFoundError(f'File `{self.dst_path}` not found')
-        else:
-            seq = 0
-            with open(self.dst_path, 'rb') as fp:
-                while chunk := fp.read(CHUNK_SIZE):           # 读取单位长度的数据，如果为空则跳出循环
-                    pkg = self.pack_file_chunk(123, seq, chunk)
-                    self.file_q.put(pkg)                      # 写入队列
-                    seq += 1
-                else:
-                    # TODO: 文件读完, 通知
-                    pass
-            self.file_q.join()
-            self.done.set()
+        # 整理所有文件
+        self.prepare_all_files()
+
+        # 将文件数量写入队列
+        pkg = self.pack_file_count()
+        self.output_q.put(pkg)
+
+        # 将文件信息写入队列
+        for f_id in range(self.n_files):
+            pkg = self.pack_file_info(f_id, self.files[f_id])
+            self.output_q.put(pkg)
+
+        # 将对端准备就绪的文件读入 output_q
+        finished = 0
+        while finished < self.n_files:
+            f_id = self.input_q.get()
+            for pkg in self.pack_file_chunks(f_id):
+                self.output_q.put(pkg)
+            finished += 1
 
 
 class Writer(Thread):
-    '''单文件写入线程'''
+    '''文件写入线程'''
 
     def __init__(self, file_path: str, file_size: int) -> None:
         '''
@@ -111,10 +130,10 @@ class Writer(Thread):
 
         self.file_path = file_path
         self.file_size = file_size
-        self.chunk_q: Queue = Queue()
+        self.input_q: Queue[bytes] = Queue(QUEUE_SIZE)
         self.n_chunks = ceil(file_size / CHUNK_SIZE)
 
-    @staticmethod
+    @ staticmethod
     def make_empty_file(file_path: str, file_size: int):
         block_size = 1024 * 1024  # 一次写入的块大小，默认为 1Mb
         count, remain = divmod(file_size, block_size)
@@ -133,7 +152,7 @@ class Writer(Thread):
             fp.seek(position)
             fp.write(chunk)
 
-    @staticmethod
+    @ staticmethod
     def unpack_file_info(package: bytes):
         '''解包文件信息'''
         path_length = len(package) - 36  # 在 Package 中 path 前面的字段共占 36 字节
@@ -146,5 +165,5 @@ class Writer(Thread):
             self.make_empty_file(self.file_path, self.file_size)
 
         while self.n_chunks > 0:
-            seq, chunk = self.chunk_q.get()
+            seq, chunk = self.input_q.get()
             self.write_chunk(seq, chunk)
