@@ -28,10 +28,18 @@ class NetworkMixin:
         '''接收数据报文'''
         head = self.recv_all(7)
         ptype, chksum, length = unpack('>BIH', head)
+        try:
+            ptype = Ptype(ptype)
+        except (ValueError, TypeError):
+            # TODO: 更好的错误处理
+            print('ptype error')
+            return Ptype.ERROR, 0, 0, b''
+
         payload = self.recv_all(length)
 
-        # TODO: 报文错误，需重传
+        # 错误重传
+        # TODO: 不完善
         if crc32(payload) != chksum:
-            pass
+            self.send_msg(Ptype.ERROR, head)
 
-        return ptype, chksum, length, payload
+        return Ptype(ptype), chksum, length, payload

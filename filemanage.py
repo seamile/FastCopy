@@ -13,8 +13,13 @@ FileInfo = namedtuple('FileInfo', ['file_id', 'perm', 'size', 'ctime', 'mtime', 
 
 
 class Reader(Thread):
+    '''文件读取器'''
 
     def __init__(self, dst_path: str):
+        '''
+        @dst_path: 目标路径
+        '''
+
         super().__init__(daemon=True)
 
         if os.path.exists(dst_path):
@@ -33,14 +38,16 @@ class Reader(Thread):
         file_id = 0  # 文件初始 ID 为 0
 
         if os.path.isdir(self.dst_path):
+            # 目标路径是文件夹，遍历整个目录，将所有文件整理出来
             self.base_path = self.dst_path
             for directory, _, filenames in os.walk(self.dst_path):
                 for filename in filenames:
-                    self.files[file_id] = os.path.join(directory, filename)
-                    file_id += 1
+                    self.files[file_id] = os.path.join(directory, filename)  # 记录文件路径
+                    file_id += 1  # File ID 自增
             self.n_files = file_id + 1
 
         elif os.path.isfile(self.dst_path):
+            # 目标路径是单文件，直接加入文件列表
             self.base_path = os.path.dirname(self.dst_path)
             self.files[file_id] = self.dst_path
             self.n_files = 1
@@ -52,34 +59,45 @@ class Reader(Thread):
         '''封装文件总量信息'''
         return Ptype.FILE_COUNT, pack('>H', self.n_files)
 
-    def pack_file_info(self, file_id, filepath) -> Tuple[Ptype, bytes]:
+    def pack_file_info(self, file_id: int, file_path: str) -> Tuple[Ptype, bytes]:
         '''
         封装文件信息报文
+
+        @file_id: 文件编号
+        @file_path: 文件路径
 
             | file_id | perm  | size  | ctime | mtime | atime | path  |
             | :-----: | :---: | :---: | :---: | :---: | :---: | :---: |
             |   2B    |  2B   |  8B   |  8B   |  8B   |  8B   |  ...  |
         '''
-        stat = os.stat(filepath)
-        perm = stat.st_mode  # 权限, 2 Bytes
-        size = stat.st_size  # 大小, 8 Bytes
+        stat = os.stat(file_path)
+        perm = stat.st_mode    # 权限, 2 Bytes
+        size = stat.st_size    # 大小, 8 Bytes
         ctime = stat.st_ctime  # 创建时间, 8 Bytes
         mtime = stat.st_mtime  # 修改时间, 8 Bytes
         atime = stat.st_atime  # 访问时间, 8 Bytes
-        path = os.path.relpath(filepath, self.base_path).encode('utf8')  # 相对路径
+        path = os.path.relpath(file_path, self.base_path).encode('utf8')  # 相对路径
         fmt = f'>2HQ3d{len(path)}s'
         return Ptype.FILE_INFO, pack(fmt, file_id, perm, size, ctime, mtime, atime, path)
 
     def read_chunk(self, file_id: int, seq: int):
-        filepath = self.files[file_id]
+        '''
+        读取文件块
+
+        @file_id: 文件编号
+        @seq: 区块序号
+        '''
+        file_path = self.files[file_id]
         position = seq * CHUNK_SIZE
-        with open(filepath, 'rb') as fp:
+        with open(file_path, 'rb') as fp:
             fp.seek(position)
             return fp.read(CHUNK_SIZE)
 
     def pack_file_chunks(self, file_id: int):
         '''
         封装文件数据块报文
+
+        @file_id: 文件编号
 
             | file_id |  seq  | data  |
             | :-----: | :---: | :---: |
