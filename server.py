@@ -85,14 +85,25 @@ class Worker(Thread, NetworkMixin):
         self.name = 'Worker-%s:%s' % addr
         self.sock = sock
         self.addr = addr
+        self.sub_thread: Optional[Thread] = None
         self.session: Optional[Session] = None
 
     def bind_session(self, session: Session):
         self.session = session
         session.workers.append(self)
 
+    def listen_for_sender(self):
+        while True:
+            ptype, *_, pkg = self.recv_msg()
+            self.session.file_man.input_q.put((ptype, pkg))
+
     def run_as_sender(self):
         '''作为文件发送端运行'''
+        # 启动监听子线程
+        self.sub_thread = Thread(target=self.listen_for_sender)
+        self.sub_thread.start()
+
+        # 从文件读取队列获取数据，并发送到接收端
         while True:
             ptype, payload = self.session.file_man.output_q.get()
             self.send_msg(ptype, payload)

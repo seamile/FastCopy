@@ -30,7 +30,7 @@ class Reader(Thread):
         self.base_path = ''
         self.n_files = 0
         self.files: Dict[int, str] = {}
-        self.input_q: Queue[int] = Queue()
+        self.input_q: Queue[Tuple[Ptype, bytearray]] = Queue()
         self.output_q: Queue[Tuple[Ptype, bytearray]] = Queue(QUEUE_SIZE)
 
     def prepare_all_files(self):
@@ -130,6 +130,7 @@ class Reader(Thread):
         finished = 0
         while finished < self.n_files:
             f_id = self.input_q.get()
+
             for pkg in self.pack_file_chunks(f_id):
                 self.output_q.put(pkg)
             finished += 1
