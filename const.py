@@ -13,10 +13,10 @@ EOF = 0xffffffff
 
 
 class Ptype(IntEnum):
-    PULL = 0x01  # 拉取申请
-    PUSH = 0x02  # 推送申请
+    SEND = 0x01  # 推送申请
+    RECV = 0x02  # 拉取申请
     SESSION = 0x03  # 建立会话
-    FOLLOWER = 0x04  # 后续连接
+    FOLLOW = 0x04  # 后续连接
     FILE_COUNT = 0x05  # 文件总量
     FILE_INFO = 0x06  # 文件信息
     FILE_READY = 0x07  # 文件就绪
