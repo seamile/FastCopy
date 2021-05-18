@@ -1,11 +1,13 @@
 import socket
+from binascii import crc32
 from functools import wraps
+from queue import Empty, Queue
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from struct import unpack
+from struct import pack, unpack
 from threading import Lock, Thread
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
-from const import Ptype, Role
+from const import Packet, Ptype, QUEUE_SIZE, Role, BufType, LEN_HEAD
 from filemanage import Reader, Writer
 from network import NetworkMixin
 
@@ -26,6 +28,14 @@ def singleton(cls):
 
 
 class Session:
+    def __init__(self, sid: int, role: Role, dest_path: str) -> None:
+        self.id = sid
+        self.role = role
+        self.dest_path = dest_path
+
+        self.listener = DefaultSelector()
+        self.file_man: Union[Reader, Writer, None] = None
+        self.conn_pool: List[socket.socket] = []
 
     def start(self):
         raise NotImplementedError
@@ -36,26 +46,103 @@ class Session:
             sock.close()
 
 
-class Sender(Thread):
-    '''读取文件数据，并发送到对端'''
+class Buffer:
+    __slots__ = ('type', 'remain', 'ptype', 'chksum', 'data')
 
-    def __init__(self, sid: int, role: Role, dest_path: str) -> None:
-        super().__init__(daemon=True)
+    def __init__(self, btype: BufType = BufType.HEAD, remain: int = LEN_HEAD) -> None:
+        self.btype = btype
+        self.remain = remain
+        self.ptype: Optional[Ptype] = None
+        self.chksum: int = 0
+        self.data: bytearray = bytearray()
 
-        self.id = sid
-        self.role = role
-        self.dest_path = dest_path
-
-        self.listener = DefaultSelector()
-        self.file_man: Union[Reader, Writer, None] = None
-        self.conn_pool: List[socket.socket] = []
-
-    def run(self):
-        pass
+    def reset(self):
+        self.btype = BufType.HEAD
+        self.remain = LEN_HEAD
+        self.ptype = None
+        self.chksum = 0
+        self.data.clear()
 
 
-class Receiver(Session):
-    '''从对端接收数据，并保存到本地文件'''
+class ConnectionPool:
+    def __init__(self) -> None:
+        self.input_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.output_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.sender = DefaultSelector()
+        self.receiver = DefaultSelector()
+
+    def pack_msg(self, packet: Packet):
+        '''打包 packet'''
+        chksum = crc32(packet.body)
+        length = len(packet.body)
+        fmt = f'>BIH{length}s'
+        return pack(fmt, packet.ptype, chksum, length, packet.body)
+
+    def check_body(self, chksum: int, body: bytes):
+        return crc32(body) == chksum
+
+    def add_conn(self, sock: socket.socket):
+        self.sender.register(sock, EVENT_WRITE)
+        self.receiver.register(sock, EVENT_READ, Buffer())
+
+    def parse_head(self, buf: Buffer):
+        '''解析 head'''
+        # 解包
+        buf.ptype, buf.chksum, buf.remain = unpack('>BIH', buf.data)
+        buf.btype = BufType.BODY
+        buf.data.clear()
+
+    def parse_body(self, buf: Buffer):
+        '''解析 body'''
+        # 检查校验码
+        if crc32(buf.data) == buf.chksum:
+            # 正确的数据包放入队列
+            pkt = Packet(buf.ptype, buf.data)
+            self.output_q.put(pkt)
+        else:
+            print('错误的包，丢弃')
+
+        # 一个数据包解析完成后，重置 buf
+        buf.reset()
+
+    def send(self):
+        '''从 input_q 获取数据，并封包发送到对端'''
+        while True:
+            try:
+                packet = self.input_q.get(timeout=3)
+            except Empty:
+                # 队列为空，则直接进入下轮循环
+                continue
+            else:
+                for key, _ in self.sender.select(timeout=3):
+                    sock = key.fileobj
+                    msg = self.pack_msg(packet)
+                    sock.send(msg)
+                    break
+                else:
+                    # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
+                    self.input_q.queue.insert(0, packet)
+
+    def recv(self):
+        '''接收并解析数据包, 解析结果存入 output_q 队列'''
+        while True:
+            for key, _ in self.receiver.select(timeout=3):
+                sock, buf = key.fileobj, key.data
+                data = sock.recv(buf.remain)
+
+                if data:
+                    buf.remain -= len(data)  # 更新剩余长度
+                    buf.data.extend(data)  # 合并数据
+
+                    if buf.remain == 0:
+                        if buf.btype == BufType.HEAD:
+                            self.parse_head(buf)  # 解析 head 部分
+                        else:
+                            self.parse_body(buf)  # 解析 Body 部分
+                else:
+                    print('关闭连接')
+                    self.receiver.unregister(sock)
+                    sock.close()
 
 
 class WatchDog(Thread, NetworkMixin):

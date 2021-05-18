@@ -1,3 +1,4 @@
+from collections import namedtuple
 from enum import Enum, IntEnum
 
 CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
@@ -12,6 +13,16 @@ LEN_LENGTH = 2
 EOF = 0xffffffff
 
 
+class Role(Enum):
+    Sender = 1
+    Receiver = 2
+
+
+class BufType(IntEnum):
+    HEAD = 0
+    BODY = 1
+
+
 class Ptype(IntEnum):
     SEND = 0x01  # 推送申请
     RECV = 0x02  # 拉取申请
@@ -24,6 +35,4 @@ class Ptype(IntEnum):
     ERROR = 0x09  # 错误回传
 
 
-class Role(Enum):
-    Sender = 1
-    Receiver = 2
+Packet = namedtuple('Packet', ['ptype', 'body'])
