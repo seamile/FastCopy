@@ -5,7 +5,7 @@ from queue import Empty, Queue
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from struct import pack, unpack
 from threading import Lock, Thread
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from const import Packet, Ptype, QUEUE_SIZE, Role, BufType, LEN_HEAD
 from filemanage import Reader, Writer
@@ -27,32 +27,13 @@ def singleton(cls):
     return wrapper
 
 
-class Session:
-    def __init__(self, sid: int, role: Role, dest_path: str) -> None:
-        self.id = sid
-        self.role = role
-        self.dest_path = dest_path
-
-        self.listener = DefaultSelector()
-        self.file_man: Union[Reader, Writer, None] = None
-        self.conn_pool: List[socket.socket] = []
-
-    def start(self):
-        raise NotImplementedError
-
-    def close(self):
-        '''关闭所以连接'''
-        for sock in self.conn_pool:
-            sock.close()
-
-
 class Buffer:
     __slots__ = ('type', 'remain', 'ptype', 'chksum', 'data')
 
     def __init__(self, btype: BufType = BufType.HEAD, remain: int = LEN_HEAD) -> None:
         self.btype = btype
         self.remain = remain
-        self.ptype: Optional[Ptype] = None
+        self.ptype: Any = None
         self.chksum: int = 0
         self.data: bytearray = bytearray()
 
@@ -70,6 +51,8 @@ class ConnectionPool:
         self.output_q: Queue[Packet] = Queue(QUEUE_SIZE)
         self.sender = DefaultSelector()
         self.receiver = DefaultSelector()
+        self.working = True
+        self.threads: List[Thread] = []
 
     def pack_msg(self, packet: Packet):
         '''打包 packet'''
@@ -78,12 +61,14 @@ class ConnectionPool:
         fmt = f'>BIH{length}s'
         return pack(fmt, packet.ptype, chksum, length, packet.body)
 
-    def check_body(self, chksum: int, body: bytes):
-        return crc32(body) == chksum
-
     def add_conn(self, sock: socket.socket):
         self.sender.register(sock, EVENT_WRITE)
         self.receiver.register(sock, EVENT_READ, Buffer())
+
+    def rem_conn(self, sock: socket.socket):
+        self.sender.unregister(sock)
+        self.receiver.unregister(sock)
+        sock.close()
 
     def parse_head(self, buf: Buffer):
         '''解析 head'''
@@ -107,12 +92,11 @@ class ConnectionPool:
 
     def send(self):
         '''从 input_q 获取数据，并封包发送到对端'''
-        while True:
+        while self.working:
             try:
                 packet = self.input_q.get(timeout=3)
             except Empty:
-                # 队列为空，则直接进入下轮循环
-                continue
+                continue  # 队列为空，直接进入下轮循环
             else:
                 for key, _ in self.sender.select(timeout=3):
                     sock = key.fileobj
@@ -125,7 +109,7 @@ class ConnectionPool:
 
     def recv(self):
         '''接收并解析数据包, 解析结果存入 output_q 队列'''
-        while True:
+        while self.working:
             for key, _ in self.receiver.select(timeout=3):
                 sock, buf = key.fileobj, key.data
                 data = sock.recv(buf.remain)
@@ -140,9 +124,59 @@ class ConnectionPool:
                         else:
                             self.parse_body(buf)  # 解析 Body 部分
                 else:
-                    print('关闭连接')
-                    self.receiver.unregister(sock)
-                    sock.close()
+                    self.rem_conn(sock)  # 关闭连接
+
+    def launch(self):
+        s_thread = Thread(target=self.send, daemon=True)
+        s_thread.start()
+        self.threads.append(s_thread)
+
+        r_thread = Thread(target=self.recv, daemon=True)
+        r_thread.start()
+        self.threads.append(r_thread)
+
+    def close_all(self):
+        '''关闭所有连接'''
+        with self.input_q.mutex:
+            self.working = False
+            for key in list(self.sender.get_map().values()):
+                sock = key.fileobj
+                sock.close()
+
+        self.sender.close()
+        self.receiver.close()
+
+
+class Session(Thread):
+    def __init__(self, sid: int, role: Role, dest_path: str) -> None:
+        super().__init__(daemon=True)
+
+        self.id = sid
+        self.role = role
+        self.dest_path = dest_path
+
+        self.file_man: Union[Reader, Writer, None] = None
+        self.conn_pool = ConnectionPool()
+
+    def run_as_sender(self):
+        self.file_man = Reader(self.dest_path)
+        self.file_man.start()
+        while True:
+            self.file_man.output_q.get()
+
+    def run_as_receiver(self):
+        pass
+
+    def run(self):
+        self.conn_pool.launch()
+        if self.role == Role.Sender:
+            self.run_as_sender()
+        else:
+            self.run_as_receiver()
+
+    def close(self):
+        '''关闭所以连接'''
+        self.conn_pool.close_all()
 
 
 class WatchDog(Thread, NetworkMixin):
@@ -166,7 +200,7 @@ class WatchDog(Thread, NetworkMixin):
             print('run as a sender')
             dst_path = packet.decode('utf8')
             session = self.server.create_session(Role.Sender, dst_path)
-            session.conn_pool.append(self.sock)
+            session.conn_pool.add_conn(self.sock)
             session.start()
 
         elif ptype == Ptype.RECV:
@@ -174,14 +208,14 @@ class WatchDog(Thread, NetworkMixin):
             print('run as a receiver')
             dst_path = packet.decode('utf8')
             session = self.server.create_session(Role.Receiver, dst_path)
-            session.conn_pool.append(self.sock)
+            session.conn_pool.add_conn(self.sock)
             session.start()
 
         elif ptype == Ptype.FOLLOW:
             print('run as a follower')
             sid = unpack('>H', packet)[0]
             session = self.server.sessions[sid]
-            session.conn_pool.append(self.sock)
+            session.conn_pool.add_conn(self.sock)
 
         else:
             # 对于错误的类型，直接关闭连接

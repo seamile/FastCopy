@@ -19,7 +19,6 @@ class Reader(Thread):
         '''
         @dst_path: 目标路径
         '''
-
         super().__init__(daemon=True)
 
         if os.path.exists(dst_path):

@@ -1,4 +1,4 @@
-from collections import namedtuple
+from typing import NamedTuple
 from enum import Enum, IntEnum
 
 CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
@@ -35,4 +35,6 @@ class Ptype(IntEnum):
     ERROR = 0x09  # 错误回传
 
 
-Packet = namedtuple('Packet', ['ptype', 'body'])
+class Packet(NamedTuple):
+    ptype: Ptype
+    body: bytes
