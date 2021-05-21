@@ -55,8 +55,8 @@ class Packet(NamedTuple):
         if self.ptype == PacketType.SEND or self.ptype == PacketType.RECV:
             return unpack(f'>{self.length}s', self.body)  # dest path
 
-        elif self.ptype == PacketType.SESSION or self.ptype == PacketType.FOLLOW:
-            return unpack('>H', self.body)  # Session ID
+        elif self.ptype == PacketType.SID or self.ptype == PacketType.ATTACH:
+            return unpack('>H', self.body)  # Worker ID
 
         elif self.ptype == PacketType.FILE_COUNT:
             return unpack('>H', self.body)  # file count
@@ -133,11 +133,10 @@ class ConnectionPool:
 
     def parse_body(self, buf: Buffer):
         '''解析 body'''
+        pkt = Packet.load(buf.ptype, buf.data)
         # 检查校验码
-        if crc32(buf.data) == buf.chksum:
-            # 正确的数据包放入队列
-            pkt = Packet.load(buf.ptype, buf.data)
-            self.output_q.put(pkt)
+        if pkt.is_valid(buf.chksum):
+            self.output_q.put(pkt)  # 正确的数据包放入队列
         else:
             print('错误的包，丢弃')
 
@@ -200,7 +199,7 @@ class ConnectionPool:
         self.receiver.close()
 
 
-class Session(Thread):
+class Worker(Thread):
     def __init__(self, sid: int, role: Role, dest_path: str) -> None:
         super().__init__(daemon=True)
 
@@ -228,7 +227,7 @@ class Session(Thread):
             self.run_as_receiver()
 
     def close(self):
-        '''关闭所以连接'''
+        '''关闭所有连接'''
         self.conn_pool.close_all()
 
 
@@ -242,7 +241,7 @@ class WatchDog(Thread, NetworkMixin):
         try:
             # 等待接收新连接的第一个数据报文
             self.sock.settimeout(10)
-            ptype, *_, packet = self.recv_msg()
+            ptype, *_, payload = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
             self.sock.close()
@@ -251,24 +250,24 @@ class WatchDog(Thread, NetworkMixin):
         if ptype == PacketType.SEND:
             # 作为发送端运行
             print('run as a sender')
-            dst_path = packet.decode('utf8')
-            session = self.server.create_session(Role.Sender, dst_path)
-            session.conn_pool.add_conn(self.sock)
-            session.start()
+            dst_path = payload.decode('utf8')
+            worker = self.server.create_worker(Role.Sender, dst_path)
+            worker.conn_pool.add_conn(self.sock)
+            worker.start()
 
         elif ptype == PacketType.RECV:
             # 作为接收端运行
             print('run as a receiver')
-            dst_path = packet.decode('utf8')
-            session = self.server.create_session(Role.Receiver, dst_path)
-            session.conn_pool.add_conn(self.sock)
-            session.start()
+            dst_path = payload.decode('utf8')
+            worker = self.server.create_worker(Role.Receiver, dst_path)
+            worker.conn_pool.add_conn(self.sock)
+            worker.start()
 
-        elif ptype == PacketType.FOLLOW:
+        elif ptype == PacketType.ATTACH:
             print('run as a follower')
-            sid = unpack('>H', packet)[0]
-            session = self.server.sessions[sid]
-            session.conn_pool.add_conn(self.sock)
+            sid = unpack('>H', payload)[0]
+            worker = self.server.workers[sid]
+            worker.conn_pool.add_conn(self.sock)
 
         else:
             # 对于错误的类型，直接关闭连接
@@ -276,41 +275,41 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.close()
 
 
-@singleton
+@ singleton
 class Server(Thread):
 
-    def __init__(self, host, port, max_sessions=256) -> None:
+    def __init__(self, host, port, max_workers=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
-        self.max_sessions = max_sessions
+        self.max_workers = max_workers
         self.running = True
         self.mutex = Lock()
         self.next_id = 1
-        self.sessions: Dict[int, 'Session'] = {}
+        self.workers: Dict[int, 'Worker'] = {}
 
     def geneate_sid(self) -> int:
         with self.mutex:
-            if len(self.sessions) >= self.max_sessions:
-                raise ValueError('已达到最大 Session 数量，无法创建')
+            if len(self.workers) >= self.max_workers:
+                raise ValueError('已达到最大 Worker 数量，无法创建')
 
-            while self.next_id in self.sessions:
-                if self.next_id < self.max_sessions:
+            while self.next_id in self.workers:
+                if self.next_id < self.max_workers:
                     self.next_id += 1
                 else:
                     self.next_id = 1
             else:
                 return self.next_id
 
-    def create_session(self, role: 'Role', dest_path: str) -> Session:
-        '''创建新 Session'''
+    def create_worker(self, role: 'Role', dest_path: str) -> Worker:
+        '''创建新 Worker'''
         sid = self.geneate_sid()
-        self.sessions[sid] = Session(sid, role, dest_path)
-        return self.sessions[sid]
+        self.workers[sid] = Worker(sid, role, dest_path)
+        return self.workers[sid]
 
-    def close_all_sessions(self):
-        '''关闭所有 Session'''
-        for session in self.sessions.values():
-            session.close()
+    def close_all_workers(self):
+        '''关闭所有 Worker'''
+        for worker in self.workers.values():
+            worker.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)

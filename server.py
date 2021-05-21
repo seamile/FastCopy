@@ -134,7 +134,7 @@ class Worker(Thread, NetworkMixin):
             self.bind_session(session)
             self.run_as_receiver()
 
-        elif ptype == PacketType.FOLLOW:
+        elif ptype == PacketType.ATTACH:
             # 将后续连接加入对应会话
             print(f'{self.name} run as a follower')
             session_id = unpack('>H', datagram)[0]

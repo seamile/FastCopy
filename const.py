@@ -25,8 +25,8 @@ class PacketSnippet(IntEnum):
 class PacketType(IntEnum):
     SEND = 0x01  # 推送申请
     RECV = 0x02  # 拉取申请
-    SESSION = 0x03  # 建立会话
-    FOLLOW = 0x04  # 后续连接
+    SID = 0x03  # 建立会话
+    ATTACH = 0x04  # 后续连接
     FILE_COUNT = 0x05  # 文件总量
     FILE_INFO = 0x06  # 文件信息
     FILE_READY = 0x07  # 文件就绪
