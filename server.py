@@ -5,7 +5,7 @@ from struct import unpack
 from threading import Thread, Lock
 from typing import AnyStr, Dict, List, Optional, Tuple, Union
 
-from const import Ptype, Role
+from const import PacketType, Role
 from filemanage import Reader, Writer
 from network import NetworkMixin
 
@@ -120,21 +120,21 @@ class Worker(Thread, NetworkMixin):
         ptype, *_, datagram = self.recv_msg()
         print(f'Received {ptype.name} msg')
 
-        if ptype == Ptype.SEND:
+        if ptype == PacketType.SEND:
             # 服务端作为发送端运行
             print(f'{self.name} run as a sender')
             session = s_manager.new_session(Role.Sender, datagram)
             self.bind_session(session)
             self.run_as_sender()
 
-        elif ptype == Ptype.RECV:
+        elif ptype == PacketType.RECV:
             # 服务端作为接收端运行
             print(f'{self.name} run as a receiver')
             session = s_manager.new_session(Role.Receiver, datagram)
             self.bind_session(session)
             self.run_as_receiver()
 
-        elif ptype == Ptype.FOLLOW:
+        elif ptype == PacketType.FOLLOW:
             # 将后续连接加入对应会话
             print(f'{self.name} run as a follower')
             session_id = unpack('>H', datagram)[0]

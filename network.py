@@ -3,7 +3,7 @@ from binascii import crc32
 from struct import pack, unpack
 from typing import Tuple
 
-from const import Ptype
+from const import PacketType
 
 
 class NetworkMixin:
@@ -17,7 +17,7 @@ class NetworkMixin:
         self.sock.recv_into(buffer, length, socket.MSG_WAITALL)
         return buffer
 
-    def send_msg(self, ptype: Ptype, payload: bytes):
+    def send_msg(self, ptype: PacketType, payload: bytes):
         '''发送数据报文'''
         chksum = crc32(payload)
         length = len(payload)
@@ -29,17 +29,17 @@ class NetworkMixin:
         head = self.recv_all(7)
         ptype, chksum, length = unpack('>BIH', head)
         try:
-            ptype = Ptype(ptype)
+            ptype = PacketType(ptype)
         except (ValueError, TypeError):
             # TODO: 更好的错误处理
             print('ptype error')
-            return Ptype.ERROR, 0, 0, b''
+            return PacketType.ERROR, 0, 0, b''
 
         payload = self.recv_all(length)
 
         # 错误重传
         # TODO: 不完善
         if crc32(payload) != chksum:
-            self.send_msg(Ptype.ERROR, head)
+            self.send_msg(PacketType.ERROR, head)
 
-        return Ptype(ptype), chksum, length, payload
+        return PacketType(ptype), chksum, length, payload

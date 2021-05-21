@@ -5,9 +5,9 @@ from queue import Empty, Queue
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from struct import pack, unpack
 from threading import Lock, Thread
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, NamedTuple, Tuple, Union
 
-from const import Packet, Ptype, QUEUE_SIZE, Role, BufType, LEN_HEAD
+from const import PacketType, QUEUE_SIZE, Role, PacketSnippet, LEN_HEAD
 from filemanage import Reader, Writer
 from network import NetworkMixin
 
@@ -27,18 +27,77 @@ def singleton(cls):
     return wrapper
 
 
-class Buffer:
-    __slots__ = ('type', 'remain', 'ptype', 'chksum', 'data')
+class Packet(NamedTuple):
+    ptype: PacketType
+    length: int
+    body: bytes
 
-    def __init__(self, btype: BufType = BufType.HEAD, remain: int = LEN_HEAD) -> None:
-        self.btype = btype
+    @staticmethod
+    def load(ptype: Union[PacketType, int], body: bytes) -> 'Packet':
+        return Packet(PacketType(ptype), len(body), body)
+
+    @property
+    def chksum(self) -> int:
+        return crc32(self.body)
+
+    def pack(self) -> bytes:
+        '''封包'''
+        fmt = f'>BIH{self.length}s'
+        return pack(fmt, self.ptype, self.chksum, self.length, self.body)
+
+    @staticmethod
+    def parse_head(head: bytes) -> Tuple[PacketType, int, int]:
+        '''解析 Head'''
+        ptype, chksum, length = unpack('>BIH', head)
+        return PacketType(ptype), chksum, length
+
+    def parse_body(self) -> Tuple[Any, ...]:
+        if self.ptype == PacketType.SEND or self.ptype == PacketType.RECV:
+            return unpack(f'>{self.length}s', self.body)  # dest path
+
+        elif self.ptype == PacketType.SESSION or self.ptype == PacketType.FOLLOW:
+            return unpack('>H', self.body)  # Session ID
+
+        elif self.ptype == PacketType.FILE_COUNT:
+            return unpack('>H', self.body)  # file count
+
+        elif self.ptype == PacketType.FILE_INFO:
+            # file_id | perm | size | ctime | mtime | atime | chksum | path
+            #   2B    |  2B  |  8B  |  8B   |  8B   |  8B   |  16B   |  ...
+            fmt = f'>2HQ3d16s{self.length - 52}s'
+            return unpack(fmt, self.body)
+
+        elif self.ptype == PacketType.FILE_READY:
+            return unpack('>H', self.body)  # file id
+
+        elif self.ptype == PacketType.FILE_CHUNK:
+            # file_id |  seq  | chunk
+            #    2B   |  4B   |  ...
+            fmt = f'>HI{self.length - 10}'
+            return unpack(fmt, self.body)
+
+        else:
+            raise TypeError
+
+    def is_valid(self, chksum: int):
+        '''是否是有效的包体'''
+        return len(self.body) == self.length and self.chksum == chksum
+
+
+class Buffer:
+    __slots__ = ('waiting', 'remain', 'ptype', 'chksum', 'data')
+
+    def __init__(self,
+                 waiting: PacketSnippet = PacketSnippet.HEAD,
+                 remain: int = LEN_HEAD) -> None:
+        self.waiting = waiting
         self.remain = remain
         self.ptype: Any = None
         self.chksum: int = 0
         self.data: bytearray = bytearray()
 
     def reset(self):
-        self.btype = BufType.HEAD
+        self.waiting = PacketSnippet.HEAD
         self.remain = LEN_HEAD
         self.ptype = None
         self.chksum = 0
@@ -51,15 +110,8 @@ class ConnectionPool:
         self.output_q: Queue[Packet] = Queue(QUEUE_SIZE)
         self.sender = DefaultSelector()
         self.receiver = DefaultSelector()
-        self.working = True
+        self.is_working = True
         self.threads: List[Thread] = []
-
-    def pack_msg(self, packet: Packet):
-        '''打包 packet'''
-        chksum = crc32(packet.body)
-        length = len(packet.body)
-        fmt = f'>BIH{length}s'
-        return pack(fmt, packet.ptype, chksum, length, packet.body)
 
     def add_conn(self, sock: socket.socket):
         self.sender.register(sock, EVENT_WRITE)
@@ -73,8 +125,10 @@ class ConnectionPool:
     def parse_head(self, buf: Buffer):
         '''解析 head'''
         # 解包
-        buf.ptype, buf.chksum, buf.remain = unpack('>BIH', buf.data)
-        buf.btype = BufType.BODY
+        buf.ptype, buf.chksum, buf.remain = Packet.parse_head(buf.data)
+
+        # 切换 Buffer 为等待接收 body 状态
+        buf.waiting = PacketSnippet.BODY
         buf.data.clear()
 
     def parse_body(self, buf: Buffer):
@@ -82,7 +136,7 @@ class ConnectionPool:
         # 检查校验码
         if crc32(buf.data) == buf.chksum:
             # 正确的数据包放入队列
-            pkt = Packet(buf.ptype, buf.data)
+            pkt = Packet.load(buf.ptype, buf.data)
             self.output_q.put(pkt)
         else:
             print('错误的包，丢弃')
@@ -92,16 +146,15 @@ class ConnectionPool:
 
     def send(self):
         '''从 input_q 获取数据，并封包发送到对端'''
-        while self.working:
+        while self.is_working:
             try:
                 packet = self.input_q.get(timeout=3)
             except Empty:
                 continue  # 队列为空，直接进入下轮循环
             else:
                 for key, _ in self.sender.select(timeout=3):
-                    sock = key.fileobj
-                    msg = self.pack_msg(packet)
-                    sock.send(msg)
+                    msg = packet.pack()
+                    key.fileobj.send(msg)
                     break
                 else:
                     # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
@@ -109,7 +162,7 @@ class ConnectionPool:
 
     def recv(self):
         '''接收并解析数据包, 解析结果存入 output_q 队列'''
-        while self.working:
+        while self.is_working:
             for key, _ in self.receiver.select(timeout=3):
                 sock, buf = key.fileobj, key.data
                 data = sock.recv(buf.remain)
@@ -119,7 +172,7 @@ class ConnectionPool:
                     buf.data.extend(data)  # 合并数据
 
                     if buf.remain == 0:
-                        if buf.btype == BufType.HEAD:
+                        if buf.waiting == PacketSnippet.HEAD:
                             self.parse_head(buf)  # 解析 head 部分
                         else:
                             self.parse_body(buf)  # 解析 Body 部分
@@ -138,7 +191,7 @@ class ConnectionPool:
     def close_all(self):
         '''关闭所有连接'''
         with self.input_q.mutex:
-            self.working = False
+            self.is_working = False
             for key in list(self.sender.get_map().values()):
                 sock = key.fileobj
                 sock.close()
@@ -195,7 +248,7 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.close()
             return
 
-        if ptype == Ptype.SEND:
+        if ptype == PacketType.SEND:
             # 作为发送端运行
             print('run as a sender')
             dst_path = packet.decode('utf8')
@@ -203,7 +256,7 @@ class WatchDog(Thread, NetworkMixin):
             session.conn_pool.add_conn(self.sock)
             session.start()
 
-        elif ptype == Ptype.RECV:
+        elif ptype == PacketType.RECV:
             # 作为接收端运行
             print('run as a receiver')
             dst_path = packet.decode('utf8')
@@ -211,7 +264,7 @@ class WatchDog(Thread, NetworkMixin):
             session.conn_pool.add_conn(self.sock)
             session.start()
 
-        elif ptype == Ptype.FOLLOW:
+        elif ptype == PacketType.FOLLOW:
             print('run as a follower')
             sid = unpack('>H', packet)[0]
             session = self.server.sessions[sid]

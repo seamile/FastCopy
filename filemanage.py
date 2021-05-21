@@ -1,15 +1,27 @@
 import os
 from collections import namedtuple
+from hashlib import md5
 from math import ceil
 from queue import Queue
 from struct import pack, unpack
 from threading import Thread
 from typing import Dict, Tuple
 
-from const import CHUNK_SIZE, QUEUE_SIZE, EOF, Ptype
+from const import CHUNK_SIZE, QUEUE_SIZE, EOF, PacketType
 
 
-FileInfo = namedtuple('FileInfo', ['file_id', 'perm', 'size', 'ctime', 'mtime', 'atime', 'path'])
+FileInfo = namedtuple('FileInfo',
+                      ['file_id', 'perm', 'size',
+                       'ctime', 'mtime', 'atime',
+                       'checksum' 'path'])
+
+
+def filehash(filepath: str):
+    h = md5()
+    with open(filepath, 'rb') as fp:
+        while chunk := fp.read(CHUNK_SIZE):
+            h.update(chunk)
+    return h.digest()
 
 
 class Reader(Thread):
@@ -29,8 +41,8 @@ class Reader(Thread):
         self.base_path = ''
         self.n_files = 0
         self.files: Dict[int, str] = {}
-        self.input_q: Queue[Tuple[Ptype, bytearray]] = Queue()
-        self.output_q: Queue[Tuple[Ptype, bytearray]] = Queue(QUEUE_SIZE)
+        self.input_q: Queue[Tuple[PacketType, bytearray]] = Queue()
+        self.output_q: Queue[Tuple[PacketType, bytearray]] = Queue(QUEUE_SIZE)
 
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
@@ -54,11 +66,11 @@ class Reader(Thread):
         else:
             raise TypeError(f'The dest file `{self.dst_path}` is not a regular file.')
 
-    def pack_file_count(self) -> Tuple[Ptype, bytes]:
+    def pack_file_count(self) -> Tuple[PacketType, bytes]:
         '''封装文件总量信息'''
-        return Ptype.FILE_COUNT, pack('>H', self.n_files)
+        return PacketType.FILE_COUNT, pack('>H', self.n_files)
 
-    def pack_file_info(self, file_id: int, file_path: str) -> Tuple[Ptype, bytes]:
+    def pack_file_info(self, file_id: int, file_path: str) -> Tuple[PacketType, int, bytes]:
         '''
         封装文件信息报文
 
@@ -75,9 +87,11 @@ class Reader(Thread):
         ctime = stat.st_ctime  # 创建时间, 8 Bytes
         mtime = stat.st_mtime  # 修改时间, 8 Bytes
         atime = stat.st_atime  # 访问时间, 8 Bytes
+        chksum = filehash(file_path)
         path = os.path.relpath(file_path, self.base_path).encode('utf8')  # 相对路径
-        fmt = f'>2HQ3d{len(path)}s'
-        return Ptype.FILE_INFO, pack(fmt, file_id, perm, size, ctime, mtime, atime, path)
+        fmt = f'>2HQ3d16s{len(path)}s'
+        body = pack(fmt, file_id, perm, size, ctime, mtime, atime, chksum, path)
+        return PacketType.FILE_INFO, len(body), body
 
     def read_chunk(self, file_id: int, seq: int):
         '''
@@ -107,10 +121,10 @@ class Reader(Thread):
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
                 length = len(chunk)
                 fmt = f'>HI{length}s'
-                yield Ptype.FILE_CHUNK, pack(fmt, file_id, seq, chunk)
+                yield PacketType.FILE_CHUNK, pack(fmt, file_id, seq, chunk)
                 seq += 1
             else:
-                yield Ptype.FILE_CHUNK, pack('>HI', file_id, EOF)
+                yield PacketType.FILE_CHUNK, pack('>HI', file_id, EOF)
 
     def run(self):
         # 整理所有文件
@@ -174,7 +188,7 @@ class Writer(Thread):
     def unpack_file_info(package: bytes):
         '''解包文件信息'''
         path_length = len(package) - 36  # 在 Package 中 path 前面的字段共占 36 字节
-        fields = unpack(f'>2HQ3d{path_length}s', package)
+        fields = unpack(f'>2HQ3d16s{path_length}s', package)
         return FileInfo(*fields)
 
     def run(self):
