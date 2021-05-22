@@ -1,10 +1,11 @@
 import os
 from hashlib import md5
 from math import ceil
+from pathlib import Path
 from queue import Queue
 from struct import pack
 from threading import Thread
-from typing import Dict, Generator, NamedTuple, Tuple, Union
+from typing import Dict, Generator, NamedTuple, Tuple
 
 from const import CHUNK_SIZE, EOF, Flag
 from network import Packet
@@ -12,69 +13,88 @@ from network import Packet
 
 class FileInfo(NamedTuple):
     '''文件基础信息'''
-    file_id: int
+    fid: int
     perm: int
     size: int
     ctime: float
     mtime: float
     atime: float
-    checksum: bytes
-    path: Union[str, bytes]
+    chksum: bytes
+    path: Path
 
     @property
     def n_chunks(self):
         return ceil(self.size / CHUNK_SIZE)
 
+    @classmethod
+    def load(cls, file_id: int, file_path: Path, chksum: bytes = None):
+        # 读取文件状态信息
+        stat = os.stat(file_path)
+        perm = stat.st_mode    # 权限, 2 Bytes
+        size = stat.st_size    # 大小, 8 Bytes
+        ctime = stat.st_ctime  # 创建时间, 8 Bytes
+        mtime = stat.st_mtime  # 修改时间, 8 Bytes
+        atime = stat.st_atime  # 访问时间, 8 Bytes
+        chksum = chksum or cls.filehash(file_path)  # MD5 校验码
+        return cls(file_id, perm, size, ctime, mtime, atime, chksum, file_path)
 
-def filehash(filepath: str):
-    h = md5()
-    with open(filepath, 'rb') as fp:
-        while chunk := fp.read(CHUNK_SIZE):
-            h.update(chunk)
-    return h.digest()
+    @staticmethod
+    def filehash(filepath: Path) -> bytes:
+        hasher = md5()
+        with open(filepath, 'rb') as fp:
+            while chunk := fp.read(CHUNK_SIZE):
+                hasher.update(chunk)
+        return hasher.digest()
+
+    @property
+    def is_valid(self):
+        return self.chksum == self.filehash(self.path)
 
 
 class Reader(Thread):
     '''文件读取器'''
 
-    def __init__(self, dst_path: str, input_q: Queue[Packet], output_q: Queue[Packet]):
+    def __init__(self, src_path: str, input_q: Queue[Packet], output_q: Queue[Packet]) -> None:
         '''
-        @dst_path: 目标路径
+        @src_path: 要读取的目标路径
+        @input_q: 输入队列
+        @output_q: 输出队列
         '''
         super().__init__(daemon=True)
 
-        if os.path.exists(dst_path):
-            self.dst_path = dst_path
-        else:
-            raise FileNotFoundError(dst_path)
+        self.src_path = Path(src_path).absolute()
+        if not self.src_path.exists():
+            raise FileNotFoundError(src_path)
 
-        self.base_path = ''
-        self.n_files = 0
-        self.files: Dict[int, str] = {}
         self.input_q = input_q
         self.output_q = output_q
+
+        self.src_dir: Path = Path('')
+        self.n_files = 0
+        self.files: Dict[int, Path] = {}
 
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
         file_id = 0  # 文件初始 ID 为 0
 
-        if os.path.isdir(self.dst_path):
+        if self.src_path.is_dir():
             # 目标路径是文件夹，遍历整个目录，将所有文件整理出来
-            self.base_path = self.dst_path
-            for directory, _, filenames in os.walk(self.dst_path):
+            self.src_dir = self.src_path
+            for dirname, _, filenames in os.walk(self.src_path):
+                directory = Path(dirname)
                 for filename in filenames:
-                    self.files[file_id] = os.path.join(directory, filename)  # 记录文件路径
+                    self.files[file_id] = directory.joinpath(filename)  # 记录文件路径
                     file_id += 1  # File ID 自增
             self.n_files = file_id + 1
 
-        elif os.path.isfile(self.dst_path):
+        elif self.src_path.is_file():
             # 目标路径是单文件，直接加入文件列表
-            self.base_path = os.path.dirname(self.dst_path)
-            self.files[file_id] = self.dst_path
+            self.src_dir = self.src_path.parent
+            self.files[file_id] = self.src_path
             self.n_files = 1
 
         else:
-            raise TypeError(f'The dest file `{self.dst_path}` is not a regular file.')
+            raise TypeError(f'The dest file `{self.src_path}` is not a regular file.')
 
     def pack_file_count(self) -> Packet:
         '''封装文件总量信息'''
@@ -87,25 +107,17 @@ class Reader(Thread):
         @file_id: 文件编号
         @file_path: 文件路径
 
-            | file_id | perm  | size  | ctime | mtime | atime | path  |
-            | :-----: | :---: | :---: | :---: | :---: | :---: | :---: |
-            |   2B    |  2B   |  8B   |  8B   |  8B   |  8B   |  ...  |
+            | file_id | perm  | size  | ctime | mtime | atime | chksum |path  |
+            | :-----: | :---: | :---: | :---: | :---: | :---: | :----: |:---: |
+            |   2B    |  2B   |  8B   |  8B   |  8B   |  8B   |  16B   | ...  |
         '''
+        # 整理信息
         file_path = self.files[file_id]
-        # 读取文件状态信息
-        stat = os.stat(file_path)
-        perm = stat.st_mode    # 权限, 2 Bytes
-        size = stat.st_size    # 大小, 8 Bytes
-        ctime = stat.st_ctime  # 创建时间, 8 Bytes
-        mtime = stat.st_mtime  # 修改时间, 8 Bytes
-        atime = stat.st_atime  # 访问时间, 8 Bytes
-        # 计算 MD5 校验码
-        chksum = filehash(file_path)
-        # 获得文件的相对路径
-        path = os.path.relpath(file_path, self.base_path).encode('utf8')  # 相对路径
+        file_info = FileInfo.load(file_id, file_path)
+        rel_path = str(file_info.path.relative_to(self.src_dir)).encode('utf8')  # 相对路径
         # 封包
-        fmt = f'>2HQ3d16s{len(path)}s'
-        body = pack(fmt, file_id, perm, size, ctime, mtime, atime, chksum, path)
+        fmt = f'>2HQ3d16s{len(rel_path)}s'
+        body = pack(fmt, *file_info[:-1], rel_path)
         return Packet.load(Flag.FILE_INFO, body)
 
     def read_chunk(self, file_id: int, seq: int):
@@ -172,25 +184,33 @@ class Writer(Thread):
     '''文件写入线程'''
 
     def __init__(self, dst_path: str, input_q: Queue[Packet], output_q: Queue[Packet]) -> None:
+        '''
+        @dst_path: 要读取的目标路径
+        @input_q: 输入队列
+        @output_q: 输出队列
+        '''
         super().__init__(daemon=True)
 
-        self.dst_path = dst_path
+        self.dst_path = Path(dst_path).absolute()
         self.input_q = input_q
         self.output_q = output_q
 
-        self.base_path = ''
+        self.dst_dir = ''
         self.n_files = 0
         self.files: Dict[int, FileInfo] = {}
+        self.ignore_remote_path = False
 
     @staticmethod
     def make_empty_file(file_path: str, file_size: int):
         block_size = 1024 * 1024  # 一次写入的块大小，默认为 1Mb
         count, remain = divmod(file_size, block_size)
-        with open('/dev/zero', 'rb') as src_fp, open(file_path, 'wb') as dst_fp:
-            for i in range(count):
-                dst_fp.write(src_fp.read(block_size))
-            if remain > 0:
-                dst_fp.write(src_fp.read(remain))
+        chunk = b'\x00' * block_size
+        ending = b'\x00' * remain
+        with open(file_path, 'wb') as dst_fp:
+            for _ in range(count):
+                dst_fp.write(chunk)
+            else:
+                dst_fp.write(ending)
 
     @staticmethod
     def iwrite(file_info: FileInfo) -> Generator[None, Tuple[int, bytes], None]:
@@ -205,16 +225,32 @@ class Writer(Thread):
                 else:
                     raise ValueError
 
-    @staticmethod
-    def write_chunk(file_path: str, seq: int, chunk: bytes):
-        with open(file_path, 'rb+') as fp:
-            position = seq * CHUNK_SIZE
-            fp.seek(position)
-            fp.write(chunk)
+    def check_dst_path(self):
+        if self.n_files <= 0:
+            raise ValueError
+
+        elif self.n_files == 1:
+            # 单文件传输
+            if self.dst_path.is_dir():
+                self.dst_dir = self.dst_path
+            else:
+                self.dst_dir = self.dst_path.parent
+                self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
+                self.ignore_remote_path = True
+
+        else:
+            # 多文件传输
+            self.dst_dir = self.dst_path
+            self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
 
     def run(self):
         # 等待接收文件总数
-        # packet = self.input_q.get()
+        packet = self.input_q.get()
+        if packet.flag != Flag.FILE_COUNT:
+            raise ValueError
+        else:
+            self.n_files, = packet.parse_body()  # NOTE: parse_body的输出是元组，所以等号前须有逗号
+        self.check_dst_path()
         # 等待接收文件信息
         # 等待接收文件数据
         pass
