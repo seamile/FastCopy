@@ -1,15 +1,13 @@
+from queue import Queue
 import socket
-from binascii import crc32
 from functools import wraps
-from queue import Empty, Queue
-from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from struct import pack, unpack
+from struct import unpack
 from threading import Lock, Thread
-from typing import Any, Dict, List, NamedTuple, Tuple, Union
+from typing import Dict, Union
 
-from const import PacketType, QUEUE_SIZE, Role, PacketSnippet, LEN_HEAD
+from const import Flag, QUEUE_SIZE, Role
 from filemanage import Reader, Writer
-from network import NetworkMixin
+from network import ConnectionPool, NetworkMixin, Packet
 
 
 def singleton(cls):
@@ -27,208 +25,51 @@ def singleton(cls):
     return wrapper
 
 
-class Packet(NamedTuple):
-    ptype: PacketType
-    length: int
-    body: bytes
-
-    @staticmethod
-    def load(ptype: Union[PacketType, int], body: bytes) -> 'Packet':
-        return Packet(PacketType(ptype), len(body), body)
-
-    @property
-    def chksum(self) -> int:
-        return crc32(self.body)
-
-    def pack(self) -> bytes:
-        '''封包'''
-        fmt = f'>BIH{self.length}s'
-        return pack(fmt, self.ptype, self.chksum, self.length, self.body)
-
-    @staticmethod
-    def parse_head(head: bytes) -> Tuple[PacketType, int, int]:
-        '''解析 Head'''
-        ptype, chksum, length = unpack('>BIH', head)
-        return PacketType(ptype), chksum, length
-
-    def parse_body(self) -> Tuple[Any, ...]:
-        if self.ptype == PacketType.SEND or self.ptype == PacketType.RECV:
-            return unpack(f'>{self.length}s', self.body)  # dest path
-
-        elif self.ptype == PacketType.SID or self.ptype == PacketType.ATTACH:
-            return unpack('>H', self.body)  # Worker ID
-
-        elif self.ptype == PacketType.FILE_COUNT:
-            return unpack('>H', self.body)  # file count
-
-        elif self.ptype == PacketType.FILE_INFO:
-            # file_id | perm | size | ctime | mtime | atime | chksum | path
-            #   2B    |  2B  |  8B  |  8B   |  8B   |  8B   |  16B   |  ...
-            fmt = f'>2HQ3d16s{self.length - 52}s'
-            return unpack(fmt, self.body)
-
-        elif self.ptype == PacketType.FILE_READY:
-            return unpack('>H', self.body)  # file id
-
-        elif self.ptype == PacketType.FILE_CHUNK:
-            # file_id |  seq  | chunk
-            #    2B   |  4B   |  ...
-            fmt = f'>HI{self.length - 10}'
-            return unpack(fmt, self.body)
-
-        else:
-            raise TypeError
-
-    def is_valid(self, chksum: int):
-        '''是否是有效的包体'''
-        return len(self.body) == self.length and self.chksum == chksum
-
-
-class Buffer:
-    __slots__ = ('waiting', 'remain', 'ptype', 'chksum', 'data')
-
-    def __init__(self,
-                 waiting: PacketSnippet = PacketSnippet.HEAD,
-                 remain: int = LEN_HEAD) -> None:
-        self.waiting = waiting
-        self.remain = remain
-        self.ptype: Any = None
-        self.chksum: int = 0
-        self.data: bytearray = bytearray()
-
-    def reset(self):
-        self.waiting = PacketSnippet.HEAD
-        self.remain = LEN_HEAD
-        self.ptype = None
-        self.chksum = 0
-        self.data.clear()
-
-
-class ConnectionPool:
-    def __init__(self) -> None:
-        self.input_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.output_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.sender = DefaultSelector()
-        self.receiver = DefaultSelector()
-        self.is_working = True
-        self.threads: List[Thread] = []
-
-    def add_conn(self, sock: socket.socket):
-        self.sender.register(sock, EVENT_WRITE)
-        self.receiver.register(sock, EVENT_READ, Buffer())
-
-    def rem_conn(self, sock: socket.socket):
-        self.sender.unregister(sock)
-        self.receiver.unregister(sock)
-        sock.close()
-
-    def parse_head(self, buf: Buffer):
-        '''解析 head'''
-        # 解包
-        buf.ptype, buf.chksum, buf.remain = Packet.parse_head(buf.data)
-
-        # 切换 Buffer 为等待接收 body 状态
-        buf.waiting = PacketSnippet.BODY
-        buf.data.clear()
-
-    def parse_body(self, buf: Buffer):
-        '''解析 body'''
-        pkt = Packet.load(buf.ptype, buf.data)
-        # 检查校验码
-        if pkt.is_valid(buf.chksum):
-            self.output_q.put(pkt)  # 正确的数据包放入队列
-        else:
-            print('错误的包，丢弃')
-
-        # 一个数据包解析完成后，重置 buf
-        buf.reset()
-
-    def send(self):
-        '''从 input_q 获取数据，并封包发送到对端'''
-        while self.is_working:
-            try:
-                packet = self.input_q.get(timeout=3)
-            except Empty:
-                continue  # 队列为空，直接进入下轮循环
-            else:
-                for key, _ in self.sender.select(timeout=3):
-                    msg = packet.pack()
-                    key.fileobj.send(msg)
-                    break
-                else:
-                    # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
-                    self.input_q.queue.insert(0, packet)
-
-    def recv(self):
-        '''接收并解析数据包, 解析结果存入 output_q 队列'''
-        while self.is_working:
-            for key, _ in self.receiver.select(timeout=3):
-                sock, buf = key.fileobj, key.data
-                data = sock.recv(buf.remain)
-
-                if data:
-                    buf.remain -= len(data)  # 更新剩余长度
-                    buf.data.extend(data)  # 合并数据
-
-                    if buf.remain == 0:
-                        if buf.waiting == PacketSnippet.HEAD:
-                            self.parse_head(buf)  # 解析 head 部分
-                        else:
-                            self.parse_body(buf)  # 解析 Body 部分
-                else:
-                    self.rem_conn(sock)  # 关闭连接
-
-    def launch(self):
-        s_thread = Thread(target=self.send, daemon=True)
-        s_thread.start()
-        self.threads.append(s_thread)
-
-        r_thread = Thread(target=self.recv, daemon=True)
-        r_thread.start()
-        self.threads.append(r_thread)
-
-    def close_all(self):
-        '''关闭所有连接'''
-        with self.input_q.mutex:
-            self.is_working = False
-            for key in list(self.sender.get_map().values()):
-                sock = key.fileobj
-                sock.close()
-
-        self.sender.close()
-        self.receiver.close()
-
-
-class Worker(Thread):
-    def __init__(self, sid: int, role: Role, dest_path: str) -> None:
+class Sender(Thread):
+    def __init__(self, sid: int, dest_path: str) -> None:
         super().__init__(daemon=True)
 
-        self.id = sid
-        self.role = role
-        self.dest_path = dest_path
+        self.sid = sid
+        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
 
-        self.file_man: Union[Reader, Writer, None] = None
-        self.conn_pool = ConnectionPool()
+        self.reader = Reader(dest_path, self.recv_q, self.send_q)
+        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
 
-    def run_as_sender(self):
-        self.file_man = Reader(self.dest_path)
-        self.file_man.start()
-        while True:
-            self.file_man.output_q.get()
+    def run(self) -> None:
+        self.conn_pool.launch()  # 启动网络连接池
+        self.reader.start()  # 启动读取线程
 
-    def run_as_receiver(self):
-        pass
+        self.reader.join()
+        for t in self.conn_pool.threads:
+            t.join()
+
+
+class Receiver(Thread):
+    def __init__(self, sid: int, dest_path: str) -> None:
+        super().__init__(daemon=True)
+
+        self.sid = sid
+        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
+
+        self.writer = Writer(dest_path, self.recv_q, self.send_q)
+        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
 
     def run(self):
-        self.conn_pool.launch()
-        if self.role == Role.Sender:
-            self.run_as_sender()
-        else:
-            self.run_as_receiver()
+        self.conn_pool.launch()  # 启动连接池
 
     def close(self):
         '''关闭所有连接'''
         self.conn_pool.close_all()
+        self.writer.start()
+
+        self.writer.join()
+        for t in self.conn_pool.threads:
+            t.join()
+
+
+Worker = Union[Sender, Receiver]
 
 
 class WatchDog(Thread, NetworkMixin):
@@ -241,33 +82,24 @@ class WatchDog(Thread, NetworkMixin):
         try:
             # 等待接收新连接的第一个数据报文
             self.sock.settimeout(10)
-            ptype, *_, payload = self.recv_msg()
+            flag, *_, payload = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
+            # 超时退出
             self.sock.close()
             return
 
-        if ptype == PacketType.SEND:
-            # 作为发送端运行
-            print('run as a sender')
+        if flag == Flag.SEND or flag == Flag.RECV:
             dst_path = payload.decode('utf8')
-            worker = self.server.create_worker(Role.Sender, dst_path)
-            worker.conn_pool.add_conn(self.sock)
+            worker = self.server.create_worker(flag, dst_path)
+            worker.conn_pool.add(self.sock)
             worker.start()
 
-        elif ptype == PacketType.RECV:
-            # 作为接收端运行
-            print('run as a receiver')
-            dst_path = payload.decode('utf8')
-            worker = self.server.create_worker(Role.Receiver, dst_path)
-            worker.conn_pool.add_conn(self.sock)
-            worker.start()
-
-        elif ptype == PacketType.ATTACH:
+        elif flag == Flag.ATTACH:
             print('run as a follower')
             sid = unpack('>H', payload)[0]
             worker = self.server.workers[sid]
-            worker.conn_pool.add_conn(self.sock)
+            worker.conn_pool.add(self.sock)
 
         else:
             # 对于错误的类型，直接关闭连接
@@ -275,17 +107,17 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.close()
 
 
-@ singleton
+@singleton
 class Server(Thread):
 
-    def __init__(self, host, port, max_workers=256) -> None:
+    def __init__(self, host: str, port: int, max_workers=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
         self.max_workers = max_workers
-        self.running = True
+        self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
-        self.workers: Dict[int, 'Worker'] = {}
+        self.workers: Dict[int, Worker] = {}
 
     def geneate_sid(self) -> int:
         with self.mutex:
@@ -303,7 +135,10 @@ class Server(Thread):
     def create_worker(self, role: 'Role', dest_path: str) -> Worker:
         '''创建新 Worker'''
         sid = self.geneate_sid()
-        self.workers[sid] = Worker(sid, role, dest_path)
+        if role == Role.Sender:
+            self.workers[sid] = Sender(sid, dest_path)
+        else:
+            self.workers[sid] = Receiver(sid, dest_path)
         return self.workers[sid]
 
     def close_all_workers(self):
@@ -313,7 +148,7 @@ class Server(Thread):
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
-        while self.running:
+        while self.is_running:
             # wait for new connection
             cli_sock, cli_addr = self.srv_sock.accept()
             print('new connection: %s:%s' % cli_addr)

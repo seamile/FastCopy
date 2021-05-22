@@ -3,7 +3,7 @@ import sys
 from typing import Dict, Tuple
 from threading import Thread
 
-from const import PacketType, Role
+from const import Flag, Role
 from network import NetworkMixin
 from filemanage import Reader, Writer
 

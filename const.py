@@ -22,7 +22,7 @@ class PacketSnippet(IntEnum):
     BODY = 1
 
 
-class PacketType(IntEnum):
+class Flag(IntEnum):
     SEND = 0x01  # 推送申请
     RECV = 0x02  # 拉取申请
     SID = 0x03  # 建立会话

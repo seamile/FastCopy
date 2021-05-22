@@ -5,7 +5,7 @@ from struct import unpack
 from threading import Thread, Lock
 from typing import AnyStr, Dict, List, Optional, Tuple, Union
 
-from const import PacketType, Role
+from const import Flag, Role
 from filemanage import Reader, Writer
 from network import NetworkMixin
 
@@ -94,8 +94,8 @@ class Worker(Thread, NetworkMixin):
 
     def listen_for_sender(self):
         while True:
-            ptype, *_, pkg = self.recv_msg()
-            self.session.file_man.input_q.put((ptype, pkg))
+            flag, *_, pkg = self.recv_msg()
+            self.session.file_man.input_q.put((flag, pkg))
 
     def run_as_sender(self):
         '''作为文件发送端运行'''
@@ -105,36 +105,36 @@ class Worker(Thread, NetworkMixin):
 
         # 从文件读取队列获取数据，并发送到接收端
         while True:
-            ptype, payload = self.session.file_man.output_q.get()
-            self.send_msg(ptype, payload)
+            flag, payload = self.session.file_man.output_q.get()
+            self.send_msg(flag, payload)
 
     def run_as_receiver(self):
         '''作为文件接收端运行'''
         while True:
-            ptype, *_, payload = self.recv_msg()
-            self.session.file_man.input_q.put(ptype, payload)
+            flag, *_, payload = self.recv_msg()
+            self.session.file_man.input_q.put(flag, payload)
 
     def run(self) -> None:
         print(f'{self.name} is running')
         s_manager = SessionManager()
-        ptype, *_, datagram = self.recv_msg()
-        print(f'Received {ptype.name} msg')
+        flag, *_, datagram = self.recv_msg()
+        print(f'Received {flag.name} msg')
 
-        if ptype == PacketType.SEND:
+        if flag == Flag.SEND:
             # 服务端作为发送端运行
             print(f'{self.name} run as a sender')
             session = s_manager.new_session(Role.Sender, datagram)
             self.bind_session(session)
             self.run_as_sender()
 
-        elif ptype == PacketType.RECV:
+        elif flag == Flag.RECV:
             # 服务端作为接收端运行
             print(f'{self.name} run as a receiver')
             session = s_manager.new_session(Role.Receiver, datagram)
             self.bind_session(session)
             self.run_as_receiver()
 
-        elif ptype == PacketType.ATTACH:
+        elif flag == Flag.ATTACH:
             # 将后续连接加入对应会话
             print(f'{self.name} run as a follower')
             session_id = unpack('>H', datagram)[0]

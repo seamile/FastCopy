@@ -1,9 +1,184 @@
 import socket
 from binascii import crc32
+from queue import Queue, Empty
+from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from struct import pack, unpack
-from typing import Tuple
+from threading import Thread
+from typing import Any, List, NamedTuple, Tuple, Union
 
-from const import PacketType
+from const import PacketSnippet, Flag, LEN_HEAD
+
+
+class Packet(NamedTuple):
+    flag: Flag
+    length: int
+    body: bytes
+
+    @staticmethod
+    def load(flag: Union[Flag, int], body: bytes) -> 'Packet':
+        return Packet(Flag(flag), len(body), body)
+
+    @property
+    def chksum(self) -> int:
+        return crc32(self.body)
+
+    def pack(self) -> bytes:
+        '''封包'''
+        fmt = f'>BIH{self.length}s'
+        return pack(fmt, self.flag, self.chksum, self.length, self.body)
+
+    @staticmethod
+    def parse_head(head: bytes) -> Tuple[Flag, int, int]:
+        '''解析 Head'''
+        flag, chksum, length = unpack('>BIH', head)
+        return Flag(flag), chksum, length
+
+    def parse_body(self) -> Tuple[Any, ...]:
+        if self.flag == Flag.SEND or self.flag == Flag.RECV:
+            return (self.body.decode('utf8'),)  # dest path
+
+        elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
+            return unpack('>H', self.body)  # Worker ID
+
+        elif self.flag == Flag.FILE_COUNT:
+            return unpack('>H', self.body)  # file count
+
+        elif self.flag == Flag.FILE_INFO:
+            # file_id | perm | size | ctime | mtime | atime | chksum | path
+            #   2B    |  2B  |  8B  |  8B   |  8B   |  8B   |  16B   |  ...
+            fmt = f'>2HQ3d16s{self.length - 52}s'
+            return unpack(fmt, self.body)
+
+        elif self.flag == Flag.FILE_READY:
+            return unpack('>H', self.body)  # file id
+
+        elif self.flag == Flag.FILE_CHUNK:
+            # file_id |  seq  | chunk
+            #    2B   |  4B   |  ...
+            fmt = f'>HI{self.length - 6}s'
+            return unpack(fmt, self.body)
+
+        else:
+            raise TypeError
+
+    def is_valid(self, chksum: int):
+        '''是否是有效的包体'''
+        return len(self.body) == self.length and self.chksum == chksum
+
+
+class Buffer:
+    __slots__ = ('waiting', 'remain', 'flag', 'chksum', 'data')
+
+    def __init__(self,
+                 waiting: PacketSnippet = PacketSnippet.HEAD,
+                 remain: int = LEN_HEAD) -> None:
+        self.waiting = waiting
+        self.remain = remain
+        self.flag: Any = None
+        self.chksum: int = 0
+        self.data: bytearray = bytearray()
+
+    def reset(self):
+        self.waiting = PacketSnippet.HEAD
+        self.remain = LEN_HEAD
+        self.flag = None
+        self.chksum = 0
+        self.data.clear()
+
+
+class ConnectionPool:
+    def __init__(self, send_q: Queue[Packet], recv_q: Queue[Packet]) -> None:
+        self.send_q = send_q
+        self.recv_q = recv_q
+        self.sender = DefaultSelector()
+        self.receiver = DefaultSelector()
+        self.is_working = True
+        self.threads: List[Thread] = []
+
+    def add(self, sock: socket.socket):
+        self.sender.register(sock, EVENT_WRITE)
+        self.receiver.register(sock, EVENT_READ, Buffer())
+
+    def remove(self, sock: socket.socket):
+        self.sender.unregister(sock)
+        self.receiver.unregister(sock)
+        sock.close()
+
+    def parse_head(self, buf: Buffer):
+        '''解析 head'''
+        # 解包
+        buf.flag, buf.chksum, buf.remain = Packet.parse_head(buf.data)
+
+        # 切换 Buffer 为等待接收 body 状态
+        buf.waiting = PacketSnippet.BODY
+        buf.data.clear()
+
+    def parse_body(self, buf: Buffer):
+        '''解析 body'''
+        pkt = Packet.load(buf.flag, buf.data)
+        # 检查校验码
+        if pkt.is_valid(buf.chksum):
+            self.recv_q.put(pkt)  # 正确的数据包放入队列
+        else:
+            print('错误的包，丢弃')
+
+        # 一个数据包解析完成后，重置 buf
+        buf.reset()
+
+    def send(self):
+        '''从 send_q 获取数据，并封包发送到对端'''
+        while self.is_working:
+            try:
+                packet = self.send_q.get(timeout=3)
+            except Empty:
+                continue  # 队列为空，直接进入下轮循环
+            else:
+                for key, _ in self.sender.select(timeout=3):
+                    msg = packet.pack()
+                    key.fileobj.send(msg)
+                    break
+                else:
+                    # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
+                    self.send_q.queue.insert(0, packet)
+
+    def recv(self):
+        '''接收并解析数据包, 解析结果存入 recv_q 队列'''
+        while self.is_working:
+            for key, _ in self.receiver.select(timeout=3):
+                sock, buf = key.fileobj, key.data
+                data = sock.recv(buf.remain)
+
+                if data:
+                    buf.remain -= len(data)  # 更新剩余长度
+                    buf.data.extend(data)  # 合并数据
+
+                    if buf.remain == 0:
+                        if buf.waiting == PacketSnippet.HEAD:
+                            self.parse_head(buf)  # 解析 head 部分
+                        else:
+                            self.parse_body(buf)  # 解析 Body 部分
+                else:
+                    self.remove(sock)  # 关闭连接
+
+    def launch(self):
+        s_thread = Thread(target=self.send, daemon=True)
+        s_thread.start()
+        self.threads.append(s_thread)
+
+        r_thread = Thread(target=self.recv, daemon=True)
+        r_thread.start()
+        self.threads.append(r_thread)
+
+    def close_all(self):
+        '''关闭所有连接'''
+        with self.send_q.mutex:
+            self.is_working = False
+            for key in list(self.sender.get_map().values()):
+                sock = key.fileobj
+                sock.close()
+
+        self.sender.close()
+        self.receiver.close()
 
 
 class NetworkMixin:
@@ -17,29 +192,29 @@ class NetworkMixin:
         self.sock.recv_into(buffer, length, socket.MSG_WAITALL)
         return buffer
 
-    def send_msg(self, ptype: PacketType, payload: bytes):
+    def send_msg(self, flag: Flag, payload: bytes):
         '''发送数据报文'''
         chksum = crc32(payload)
         length = len(payload)
         fmt = f'>BIH{length}s'
-        return pack(fmt, ptype, chksum, length, payload)
+        return pack(fmt, flag, chksum, length, payload)
 
     def recv_msg(self):
         '''接收数据报文'''
         head = self.recv_all(7)
-        ptype, chksum, length = unpack('>BIH', head)
+        flag, chksum, length = unpack('>BIH', head)
         try:
-            ptype = PacketType(ptype)
+            flag = Flag(flag)
         except (ValueError, TypeError):
             # TODO: 更好的错误处理
-            print('ptype error')
-            return PacketType.ERROR, 0, 0, b''
+            print('flag error')
+            return Flag.ERROR, 0, 0, b''
 
         payload = self.recv_all(length)
 
         # 错误重传
         # TODO: 不完善
         if crc32(payload) != chksum:
-            self.send_msg(PacketType.ERROR, head)
+            self.send_msg(Flag.ERROR, head)
 
-        return PacketType(ptype), chksum, length, payload
+        return Flag(flag), chksum, length, payload
