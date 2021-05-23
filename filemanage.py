@@ -197,8 +197,9 @@ class Writer(Thread):
 
         self.dst_dir = ''
         self.n_files = 0
+        self.n_finished = 0
         self.files: Dict[int, FileInfo] = {}
-        self.ignore_remote_path = False
+        self.use_custom_dst_path = False
 
     @staticmethod
     def make_empty_file(file_path: str, file_size: int):
@@ -226,6 +227,7 @@ class Writer(Thread):
                     raise ValueError
 
     def check_dst_path(self):
+        '''检查目标路径'''
         if self.n_files <= 0:
             raise ValueError
 
@@ -236,7 +238,7 @@ class Writer(Thread):
             else:
                 self.dst_dir = self.dst_path.parent
                 self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
-                self.ignore_remote_path = True
+                self.use_custom_dst_path = True
 
         else:
             # 多文件传输
@@ -248,9 +250,25 @@ class Writer(Thread):
         packet = self.input_q.get()
         if packet.flag != Flag.FILE_COUNT:
             raise ValueError
-        else:
-            self.n_files, = packet.parse_body()  # NOTE: parse_body的输出是元组，所以等号前须有逗号
+
+        # 取出文件总数，并确认目标路径
+        # NOTE: parse_body 的输出是元组，所以等号前须有逗号
+        self.n_files, = packet.parse_body()
         self.check_dst_path()
-        # 等待接收文件信息
-        # 等待接收文件数据
-        pass
+
+        # 等待接收文件信息和数据
+        while True:
+            packet = self.input_q.get()
+            if packet.flag == Flag.FILE_INFO:
+                result = packet.parse_body()
+                f_info = FileInfo(*result)
+                full_path = self.dst_dir.joinpath(f_info.path)
+
+                self.make_empty_file(full_path, f_info.size)
+                ready_pkt = Packet.pack_ready()  # TODO
+                self.output_q.put(ready_pkt)
+
+            elif packet.flag == Flag.FILE_CHUNK:
+                pass
+            else:
+                pass

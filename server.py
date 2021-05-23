@@ -11,17 +11,17 @@ from network import NetworkMixin
 
 
 class Session:
-    def __init__(self, session_id: int, role: Role, dest_path: AnyStr) -> None:
+    def __init__(self, session_id: int, role: Role, dst_path: AnyStr) -> None:
         self.id = session_id
         self.role = role
-        self.dest_path = dest_path  # type: Union[str, bytes]
+        self.dst_path = dst_path  # type: Union[str, bytes]
 
         self.file_man: Union[Reader, Writer, None] = None
         self.workers: List['Worker'] = []
 
     def launch_reader(self):
         '''启动 Reader'''
-        self.file_man = Reader(self.dest_path)
+        self.file_man = Reader(self.dst_path)
         self.file_man.start()
 
     def launch_writer(self):
@@ -64,9 +64,9 @@ class SessionManager:
             else:
                 return self.next_id
 
-    def new_session(self, role: Role, dest_path: AnyStr) -> Session:
+    def new_session(self, role: Role, dst_path: AnyStr) -> Session:
         session_id = self.new_id()
-        session = Session(session_id, role, dest_path)
+        session = Session(session_id, role, dst_path)
         return session
 
     def get_session(self, session_id: int) -> Session:
@@ -120,14 +120,14 @@ class Worker(Thread, NetworkMixin):
         flag, *_, datagram = self.recv_msg()
         print(f'Received {flag.name} msg')
 
-        if flag == Flag.SEND:
+        if flag == Flag.PULL:
             # 服务端作为发送端运行
             print(f'{self.name} run as a sender')
             session = s_manager.new_session(Role.Sender, datagram)
             self.bind_session(session)
             self.run_as_sender()
 
-        elif flag == Flag.RECV:
+        elif flag == Flag.PUSH:
             # 服务端作为接收端运行
             print(f'{self.name} run as a receiver')
             session = s_manager.new_session(Role.Receiver, datagram)

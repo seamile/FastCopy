@@ -22,6 +22,32 @@ class Packet(NamedTuple):
     def chksum(self) -> int:
         return crc32(self.body)
 
+    @staticmethod
+    def pack_body(flag: Flag, *args) -> bytes:
+        '''将包体封包'''
+        if flag == Flag.PULL or flag == Flag.PUSH:
+            return str(args[0]).encode('utf8')
+
+        elif flag == Flag.SID or flag == Flag.ATTACH:
+            return pack('>H', *args)
+
+        elif flag == Flag.FILE_COUNT:
+            return pack('>H', *args)
+
+        elif flag == Flag.FILE_INFO:
+            length = len(args[-1])
+            return pack(f'>2HQ3d16s{length}s', *args)
+
+        elif flag == Flag.FILE_READY:
+            return pack('>H', *args)
+
+        elif flag == Flag.FILE_CHUNK:
+            length = len(args[-1])
+            return pack(f'>HI{length}s', *args)
+
+        else:
+            raise ValueError('Invalid flag')
+
     def pack(self) -> bytes:
         '''封包'''
         fmt = f'>BIH{self.length}s'
@@ -34,7 +60,7 @@ class Packet(NamedTuple):
         return Flag(flag), chksum, length
 
     def parse_body(self) -> Tuple[Any, ...]:
-        if self.flag == Flag.SEND or self.flag == Flag.RECV:
+        if self.flag == Flag.PULL or self.flag == Flag.PUSH:
             return (self.body.decode('utf8'),)  # dest path
 
         elif self.flag == Flag.SID or self.flag == Flag.ATTACH:

@@ -23,8 +23,8 @@ class PacketSnippet(IntEnum):
 
 
 class Flag(IntEnum):
-    SEND = 0x01  # 推送申请
-    RECV = 0x02  # 拉取申请
+    PUSH = 0x01  # 推送申请
+    PULL = 0x02  # 拉取申请
     SID = 0x03  # 建立会话
     ATTACH = 0x04  # 后续连接
     FILE_COUNT = 0x05  # 文件总量

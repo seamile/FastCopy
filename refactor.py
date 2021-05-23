@@ -5,7 +5,7 @@ from struct import unpack
 from threading import Lock, Thread
 from typing import Dict, Union
 
-from const import Flag, QUEUE_SIZE, Role
+from const import Flag, QUEUE_SIZE
 from filemanage import Reader, Writer
 from network import ConnectionPool, NetworkMixin, Packet
 
@@ -26,14 +26,14 @@ def singleton(cls):
 
 
 class Sender(Thread):
-    def __init__(self, sid: int, dest_path: str) -> None:
+    def __init__(self, sid: int, dst_path: str) -> None:
         super().__init__(daemon=True)
 
         self.sid = sid
         self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
         self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
 
-        self.reader = Reader(dest_path, self.recv_q, self.send_q)
+        self.reader = Reader(dst_path, self.recv_q, self.send_q)
         self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
 
     def run(self) -> None:
@@ -46,14 +46,14 @@ class Sender(Thread):
 
 
 class Receiver(Thread):
-    def __init__(self, sid: int, dest_path: str) -> None:
+    def __init__(self, sid: int, dst_path: str) -> None:
         super().__init__(daemon=True)
 
         self.sid = sid
         self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
         self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
 
-        self.writer = Writer(dest_path, self.recv_q, self.send_q)
+        self.writer = Writer(dst_path, self.recv_q, self.send_q)
         self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
 
     def run(self):
@@ -82,20 +82,20 @@ class WatchDog(Thread, NetworkMixin):
         try:
             # 等待接收新连接的第一个数据报文
             self.sock.settimeout(10)
-            flag, *_, payload = self.recv_msg()
+            cli_flag, *_, payload = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
             self.sock.close()
             return
 
-        if flag == Flag.SEND or flag == Flag.RECV:
+        if cli_flag == Flag.PULL or cli_flag == Flag.PUSH:
             dst_path = payload.decode('utf8')
-            worker = self.server.create_worker(flag, dst_path)
+            worker = self.server.create_worker(cli_flag, dst_path)
             worker.conn_pool.add(self.sock)
             worker.start()
 
-        elif flag == Flag.ATTACH:
+        elif cli_flag == Flag.ATTACH:
             print('run as a follower')
             sid = unpack('>H', payload)[0]
             worker = self.server.workers[sid]
@@ -132,13 +132,13 @@ class Server(Thread):
             else:
                 return self.next_id
 
-    def create_worker(self, role: 'Role', dest_path: str) -> Worker:
+    def create_worker(self, cli_flag: Flag, dst_path: str) -> Worker:
         '''创建新 Worker'''
         sid = self.geneate_sid()
-        if role == Role.Sender:
-            self.workers[sid] = Sender(sid, dest_path)
+        if cli_flag == Flag.PULL:
+            self.workers[sid] = Sender(sid, dst_path)
         else:
-            self.workers[sid] = Receiver(sid, dest_path)
+            self.workers[sid] = Receiver(sid, dst_path)
         return self.workers[sid]
 
     def close_all_workers(self):

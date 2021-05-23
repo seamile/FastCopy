@@ -34,9 +34,9 @@
     - 方向: Client -> Server
     - Payload 格式为:
 
-        | dest_path |
-        | :-------: |
-        |    ...    |
+        | dst_path |
+        | :------: |
+        |   ...    |
 
 2. 建立会话
 
