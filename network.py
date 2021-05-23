@@ -11,42 +11,44 @@ from const import PacketSnippet, Flag, LEN_HEAD
 
 class Packet(NamedTuple):
     flag: Flag
-    length: int
     body: bytes
 
     @staticmethod
     def load(flag: Union[Flag, int], body: bytes) -> 'Packet':
-        return Packet(Flag(flag), len(body), body)
+        return Packet(Flag(flag), body)
+
+    @property
+    def length(self) -> int:
+        return len(self.body)
 
     @property
     def chksum(self) -> int:
         return crc32(self.body)
 
     @staticmethod
-    def pack_body(flag: Flag, *args) -> bytes:
+    def pack_msg(flag: Flag, *args) -> bytes:
         '''将包体封包'''
         if flag == Flag.PULL or flag == Flag.PUSH:
-            return str(args[0]).encode('utf8')
-
+            body = str(args[0]).encode('utf8')
         elif flag == Flag.SID or flag == Flag.ATTACH:
-            return pack('>H', *args)
-
+            body = pack('>H', *args)
         elif flag == Flag.FILE_COUNT:
-            return pack('>H', *args)
-
+            body = pack('>H', *args)
         elif flag == Flag.FILE_INFO:
             length = len(args[-1])
-            return pack(f'>2HQ3d16s{length}s', *args)
-
+            body = pack(f'>2HQ3d16s{length}s', *args)
         elif flag == Flag.FILE_READY:
-            return pack('>H', *args)
-
+            body = pack('>H', *args)
         elif flag == Flag.FILE_CHUNK:
             length = len(args[-1])
-            return pack(f'>HI{length}s', *args)
-
+            body = pack(f'>HI{length}s', *args)
         else:
             raise ValueError('Invalid flag')
+
+        length = len(body)
+        chksum = crc32(body)
+        fmt = f'>BIH{length}s'
+        return pack(fmt, flag, chksum, length, body)
 
     def pack(self) -> bytes:
         '''封包'''
@@ -54,12 +56,13 @@ class Packet(NamedTuple):
         return pack(fmt, self.flag, self.chksum, self.length, self.body)
 
     @staticmethod
-    def parse_head(head: bytes) -> Tuple[Flag, int, int]:
-        '''解析 Head'''
+    def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
+        '''解析 head'''
         flag, chksum, length = unpack('>BIH', head)
         return Flag(flag), chksum, length
 
-    def parse_body(self) -> Tuple[Any, ...]:
+    def unpack_body(self) -> Tuple[Any, ...]:
+        '''将 body 解包'''
         if self.flag == Flag.PULL or self.flag == Flag.PUSH:
             return (self.body.decode('utf8'),)  # dest path
 
@@ -89,7 +92,7 @@ class Packet(NamedTuple):
 
     def is_valid(self, chksum: int):
         '''是否是有效的包体'''
-        return len(self.body) == self.length and self.chksum == chksum
+        return self.chksum == chksum
 
 
 class Buffer:
@@ -133,7 +136,7 @@ class ConnectionPool:
     def parse_head(self, buf: Buffer):
         '''解析 head'''
         # 解包
-        buf.flag, buf.chksum, buf.remain = Packet.parse_head(buf.data)
+        buf.flag, buf.chksum, buf.remain = Packet.unpack_head(buf.data)
 
         # 切换 Buffer 为等待接收 body 状态
         buf.waiting = PacketSnippet.BODY
@@ -141,7 +144,7 @@ class ConnectionPool:
 
     def parse_body(self, buf: Buffer):
         '''解析 body'''
-        pkt = Packet.load(buf.flag, buf.data)
+        pkt = Packet(buf.flag, buf.data)
         # 检查校验码
         if pkt.is_valid(buf.chksum):
             self.recv_q.put(pkt)  # 正确的数据包放入队列

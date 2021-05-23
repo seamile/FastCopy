@@ -98,7 +98,7 @@ class Reader(Thread):
 
     def pack_file_count(self) -> Packet:
         '''封装文件总量信息'''
-        return Packet.load(Flag.FILE_COUNT, pack('>H', self.n_files))
+        return Packet(Flag.FILE_COUNT, pack('>H', self.n_files))
 
     def pack_file_info(self, file_id: int) -> Packet:
         '''
@@ -118,7 +118,7 @@ class Reader(Thread):
         # 封包
         fmt = f'>2HQ3d16s{len(rel_path)}s'
         body = pack(fmt, *file_info[:-1], rel_path)
-        return Packet.load(Flag.FILE_INFO, body)
+        return Packet(Flag.FILE_INFO, body)
 
     def read_chunk(self, file_id: int, seq: int):
         '''
@@ -151,11 +151,11 @@ class Reader(Thread):
                 length = len(chunk)
                 fmt = f'>HI{length}s'
                 body = pack(fmt, file_id, seq, chunk)
-                yield Packet.load(flag, body)
+                yield Packet(flag, body)
                 seq += 1
             else:
                 body = pack('>HI', file_id, EOF)
-                yield Packet.load(flag, body)
+                yield Packet(flag, body)
 
     def run(self):
         # 整理所有文件
@@ -252,15 +252,15 @@ class Writer(Thread):
             raise ValueError
 
         # 取出文件总数，并确认目标路径
-        # NOTE: parse_body 的输出是元组，所以等号前须有逗号
-        self.n_files, = packet.parse_body()
+        # NOTE: unpack_body 的输出是元组，所以等号前须有逗号
+        self.n_files, = packet.unpack_body()
         self.check_dst_path()
 
         # 等待接收文件信息和数据
         while True:
             packet = self.input_q.get()
             if packet.flag == Flag.FILE_INFO:
-                result = packet.parse_body()
+                result = packet.unpack_body()
                 f_info = FileInfo(*result)
                 full_path = self.dst_dir.joinpath(f_info.path)
 
