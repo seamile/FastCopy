@@ -3,7 +3,6 @@ from hashlib import md5
 from math import ceil
 from pathlib import Path
 from queue import Queue
-from struct import pack
 from threading import Thread
 from typing import Dict, Generator, NamedTuple, Tuple
 
@@ -20,23 +19,24 @@ class FileInfo(NamedTuple):
     mtime: float
     atime: float
     chksum: bytes
-    path: Path
+    relpath: Path  # 文件的相对路径
 
     @property
     def n_chunks(self):
         return ceil(self.size / CHUNK_SIZE)
 
     @classmethod
-    def load(cls, file_id: int, file_path: Path, chksum: bytes = None):
+    def load(cls, file_id: int, filepath: Path, dirpath: Path):
         # 读取文件状态信息
-        stat = os.stat(file_path)
-        perm = stat.st_mode    # 权限, 2 Bytes
-        size = stat.st_size    # 大小, 8 Bytes
-        ctime = stat.st_ctime  # 创建时间, 8 Bytes
-        mtime = stat.st_mtime  # 修改时间, 8 Bytes
-        atime = stat.st_atime  # 访问时间, 8 Bytes
-        chksum = chksum or cls.filehash(file_path)  # MD5 校验码
-        return cls(file_id, perm, size, ctime, mtime, atime, chksum, file_path)
+        stat = os.stat(filepath)
+        perm = stat.st_mode                      # 权限, 2 Bytes
+        size = stat.st_size                      # 大小, 8 Bytes
+        ctime = stat.st_ctime                    # 创建时间, 8 Bytes
+        mtime = stat.st_mtime                    # 修改时间, 8 Bytes
+        atime = stat.st_atime                    # 访问时间, 8 Bytes
+        chksum = cls.filehash(filepath)          # 文件 MD5 校验码
+        relpath = filepath.relative_to(dirpath)  # 计算相对路径
+        return cls(file_id, perm, size, ctime, mtime, atime, chksum, relpath)
 
     @staticmethod
     def filehash(filepath: Path) -> bytes:
@@ -46,9 +46,8 @@ class FileInfo(NamedTuple):
                 hasher.update(chunk)
         return hasher.digest()
 
-    @property
-    def is_valid(self):
-        return self.chksum == self.filehash(self.path)
+    def fullpath(self, dirpath: Path):
+        return dirpath.joinpath(self.relpath).absolute()
 
 
 class Reader(Thread):
@@ -96,30 +95,6 @@ class Reader(Thread):
         else:
             raise TypeError(f'The dest file `{self.src_path}` is not a regular file.')
 
-    def pack_file_count(self) -> Packet:
-        '''封装文件总量信息'''
-        return Packet(Flag.FILE_COUNT, pack('>H', self.n_files))
-
-    def pack_file_info(self, file_id: int) -> Packet:
-        '''
-        封装文件信息报文
-
-        @file_id: 文件编号
-        @file_path: 文件路径
-
-            | file_id | perm  | size  | ctime | mtime | atime | chksum |path  |
-            | :-----: | :---: | :---: | :---: | :---: | :---: | :----: |:---: |
-            |   2B    |  2B   |  8B   |  8B   |  8B   |  8B   |  16B   | ...  |
-        '''
-        # 整理信息
-        file_path = self.files[file_id]
-        file_info = FileInfo.load(file_id, file_path)
-        rel_path = str(file_info.path.relative_to(self.src_dir)).encode('utf8')  # 相对路径
-        # 封包
-        fmt = f'>2HQ3d16s{len(rel_path)}s'
-        body = pack(fmt, *file_info[:-1], rel_path)
-        return Packet(Flag.FILE_INFO, body)
-
     def read_chunk(self, file_id: int, seq: int):
         '''
         读取文件块
@@ -133,41 +108,28 @@ class Reader(Thread):
             fp.seek(position)
             return fp.read(CHUNK_SIZE)
 
-    def pack_file_chunks(self, file_id: int) -> Generator[Packet, None, None]:
-        '''
-        封装文件数据块报文
-
-        @file_id: 文件编号
-
-            | file_id |  seq  | data  |
-            | :-----: | :---: | :---: |
-            |   2B    |  4B   |  ...  |
-        '''
-        seq = 0
-        flag = Flag.FILE_CHUNK
-
+    def iread(self, file_id: int) -> Generator[Packet, None, None]:
+        '''封装文件数据块报文'''
         with open(self.files[file_id], 'rb') as fp:
+            seq = 0
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
-                length = len(chunk)
-                fmt = f'>HI{length}s'
-                body = pack(fmt, file_id, seq, chunk)
-                yield Packet(flag, body)
+                yield Packet.load(Flag.FILE_CHUNK, file_id, seq, chunk)
                 seq += 1
             else:
-                body = pack('>HI', file_id, EOF)
-                yield Packet(flag, body)
+                yield Packet.load(Flag.FILE_CHUNK, file_id, EOF, b'')
 
     def run(self):
         # 整理所有文件
         self.prepare_all_files()
 
         # 将文件数量写入队列
-        packet = self.pack_file_count()
+        packet = Packet.load(Flag.FILE_COUNT, self.n_files)
         self.output_q.put(packet)
 
         # 将文件信息写入队列
         for f_id in range(self.n_files):
-            packet = self.pack_file_info(f_id)
+            file_info = FileInfo.load(f_id, self.files[f_id], self.src_dir)
+            packet = Packet.load(Flag.FILE_INFO, *file_info)
             self.output_q.put(packet)
 
         # 将对端准备就绪的文件读入 output_q
@@ -175,7 +137,7 @@ class Reader(Thread):
         while finished < self.n_files:
             packet = self.input_q.get()
 
-            for packet in self.pack_file_chunks(f_id):
+            for packet in self.iread(f_id):
                 self.output_q.put(packet)
             finished += 1
 
@@ -195,10 +157,11 @@ class Writer(Thread):
         self.input_q = input_q
         self.output_q = output_q
 
-        self.dst_dir = ''
+        self.dst_dir = Path('')
         self.n_files = 0
         self.n_finished = 0
         self.files: Dict[int, FileInfo] = {}
+        self.iwriters: Dict[int, Generator] = {}
         self.use_custom_dst_path = False
 
     @staticmethod
@@ -214,9 +177,9 @@ class Writer(Thread):
                 dst_fp.write(ending)
 
     @staticmethod
-    def iwrite(file_info: FileInfo) -> Generator[None, Tuple[int, bytes], None]:
-        seqs = {i for i in range(file_info.n_chunks)}
-        with open(file_info.path, 'rb+') as fp:
+    def iwrite(filepath: Path, n_chunks: int) -> Generator[None, Tuple[int, bytes], None]:
+        seqs = {i for i in range(n_chunks)}
+        with open(filepath, 'rb+') as fp:
             while seqs:
                 seq, chunk = yield
                 if seq in seqs:
@@ -245,6 +208,30 @@ class Writer(Thread):
             self.dst_dir = self.dst_path
             self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
 
+    def handle_file_info(self, packet: Packet):
+        '''处理文件信息报文'''
+        # 解包，并创建 FileInfo 对象
+        fid, perm, size, ctime, mtime, atime, chksum, relpath = packet.unpack_body()
+        relpath = Path(relpath.decode('utf8'))
+        f_info = FileInfo(fid, perm, size, ctime, mtime, atime, chksum, relpath)
+
+        # 创建空文件
+        full_path = f_info.fullpath(self.dst_dir)
+        self.make_empty_file(full_path, f_info.size)
+
+        # 创建并启动写入迭代器
+        self.iwriters[fid] = self.iwrite(full_path, f_info.n_chunks)
+        self.iwriters[fid].send(None)
+
+        # 创建文件准备就绪报文
+        ready_pkt = Packet.load(Flag.FILE_READY, f_info.fid)
+        self.output_q.put(ready_pkt)
+
+    def handle_file_chunk(self, packet: Packet):
+        '''处理文件数据块'''
+        file_id, seq, chunk = packet.unpack_body()
+        self.iwriters[file_id].send((seq, chunk))
+
     def run(self):
         # 等待接收文件总数
         packet = self.input_q.get()
@@ -260,15 +247,10 @@ class Writer(Thread):
         while True:
             packet = self.input_q.get()
             if packet.flag == Flag.FILE_INFO:
-                result = packet.unpack_body()
-                f_info = FileInfo(*result)
-                full_path = self.dst_dir.joinpath(f_info.path)
-
-                self.make_empty_file(full_path, f_info.size)
-                ready_pkt = Packet.pack_ready()  # TODO
-                self.output_q.put(ready_pkt)
+                self.handle_file_info(packet)
 
             elif packet.flag == Flag.FILE_CHUNK:
-                pass
+                self.handle_file_chunk(packet)
+
             else:
-                pass
+                raise ValueError(packet.flag)

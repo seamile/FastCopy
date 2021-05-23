@@ -4,7 +4,7 @@ from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from struct import pack, unpack
 from threading import Thread
-from typing import Any, List, NamedTuple, Tuple, Union
+from typing import Any, List, NamedTuple, Tuple
 
 from const import PacketSnippet, Flag, LEN_HEAD
 
@@ -12,10 +12,6 @@ from const import PacketSnippet, Flag, LEN_HEAD
 class Packet(NamedTuple):
     flag: Flag
     body: bytes
-
-    @staticmethod
-    def load(flag: Union[Flag, int], body: bytes) -> 'Packet':
-        return Packet(Flag(flag), body)
 
     @property
     def length(self) -> int:
@@ -26,7 +22,7 @@ class Packet(NamedTuple):
         return crc32(self.body)
 
     @staticmethod
-    def pack_msg(flag: Flag, *args) -> bytes:
+    def load(flag: Flag, *args) -> 'Packet':
         '''将包体封包'''
         if flag == Flag.PULL or flag == Flag.PUSH:
             body = str(args[0]).encode('utf8')
@@ -44,11 +40,7 @@ class Packet(NamedTuple):
             body = pack(f'>HI{length}s', *args)
         else:
             raise ValueError('Invalid flag')
-
-        length = len(body)
-        chksum = crc32(body)
-        fmt = f'>BIH{length}s'
-        return pack(fmt, flag, chksum, length, body)
+        return Packet(flag, body)
 
     def pack(self) -> bytes:
         '''封包'''
