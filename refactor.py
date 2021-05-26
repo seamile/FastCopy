@@ -1,13 +1,14 @@
-from queue import Queue
+#!/usr/bin/env python
+
 import socket
 from functools import wraps
 from struct import unpack
 from threading import Lock, Thread
-from typing import Dict, Union
+from typing import Dict
 
-from const import Flag, QUEUE_SIZE
-from filemanage import Reader, Writer
-from network import ConnectionPool, NetworkMixin, Packet
+from const import Flag
+from network import NetworkMixin
+from transfer import Sender, Receiver, Transfer
 
 
 def singleton(cls):
@@ -23,53 +24,6 @@ def singleton(cls):
             obj = cls(*args, **kwargs)
             return obj
     return wrapper
-
-
-class Sender(Thread):
-    def __init__(self, sid: int, dst_path: str) -> None:
-        super().__init__(daemon=True)
-
-        self.sid = sid
-        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
-
-        self.reader = Reader(dst_path, self.recv_q, self.send_q)
-        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
-
-    def run(self) -> None:
-        self.conn_pool.launch()  # 启动网络连接池
-        self.reader.start()  # 启动读取线程
-
-        self.reader.join()
-        for t in self.conn_pool.threads:
-            t.join()
-
-
-class Receiver(Thread):
-    def __init__(self, sid: int, dst_path: str) -> None:
-        super().__init__(daemon=True)
-
-        self.sid = sid
-        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
-
-        self.writer = Writer(dst_path, self.recv_q, self.send_q)
-        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
-
-    def run(self):
-        self.conn_pool.launch()  # 启动连接池
-
-    def close(self):
-        '''关闭所有连接'''
-        self.conn_pool.close_all()
-        self.writer.start()
-
-        self.writer.join()
-        for t in self.conn_pool.threads:
-            t.join()
-
-
-Worker = Union[Sender, Receiver]
 
 
 class WatchDog(Thread, NetworkMixin):
@@ -113,17 +67,17 @@ class Server(Thread):
     def __init__(self, host: str, port: int, max_conn=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
-        self.max_workers = 65535  # 最大 Worker 数量，与 Session ID 相关
-        self.max_conn = max_conn  # 一个 Worker 的最大连接数
+        self.max_workers = 65535  # 最大 Transfer 数量，与 Session ID 相关
+        self.max_conn = max_conn  # 一个 Transfer 的最大连接数
         self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
-        self.workers: Dict[int, Worker] = {}
+        self.workers: Dict[int, Transfer] = {}
 
     def geneate_sid(self) -> int:
         with self.mutex:
             if len(self.workers) >= self.max_workers:
-                raise ValueError('已达到最大 Worker 数量，无法创建')
+                raise ValueError('已达到最大 Transfer 数量，无法创建')
 
             while self.next_id in self.workers:
                 if self.next_id < self.max_workers:
@@ -133,8 +87,8 @@ class Server(Thread):
             else:
                 return self.next_id
 
-    def create_worker(self, cli_flag: Flag, dst_path: str) -> Worker:
-        '''创建新 Worker'''
+    def create_worker(self, cli_flag: Flag, dst_path: str) -> Transfer:
+        '''创建新 Transfer'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
             self.workers[sid] = Sender(sid, dst_path)
@@ -143,7 +97,7 @@ class Server(Thread):
         return self.workers[sid]
 
     def close_all_workers(self):
-        '''关闭所有 Worker'''
+        '''关闭所有 Transfer'''
         for worker in self.workers.values():
             worker.close()
 
@@ -157,37 +111,6 @@ class Server(Thread):
             # launch a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
             dog.start()
-
-
-####################################################################################################
-#                                              Client                                              #
-####################################################################################################
-
-
-class Client(Thread):
-    def __init__(self, src: str, dst: str, max_conn: int) -> None:
-        super().__init__(daemon=True)
-
-        self.src = src
-        self.dst = dst
-        self.host = ''
-        self.port = 0
-
-        self.max_conn = max_conn
-        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
-        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
-
-    def parse_args(self):
-        if ':' in self.src:
-            netloc, path = self.src.split(':')
-        elif ':' in self.dst:
-            pass
-        else:
-            raise ValueError
-
-    def run(self):
-        pass
 
 
 if __name__ == '__main__':

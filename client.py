@@ -2,20 +2,14 @@
 import sys
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from textwrap import dedent
-from threading import Thread
-from typing import Dict, Tuple
-
-from const import Flag
-from network import NetworkMixin
-from filemanage import Reader, Writer
 
 
 class Client:
-    def __init__(self, host: str, port: int, loc_path: str, rem_path: str) -> None:
+    def __init__(self, host: str, port: int, src: str, dst: str, n_conn: int) -> None:
         self.addr = (host, port)
-        self.loc_path = loc_path
-        self.rem_path = rem_path
-        # self.workers: Dict[int, ] = {}
+        self.src = src
+        self.dst = dst
+        self.n_conn = n_conn
 
     def run_as_sender(self):
         '''作为发送端端运行'''
@@ -55,6 +49,37 @@ def main(parser: ArgumentParser):
         sys.exit(1)
 
 
+####################################################################################################
+#                                              Client                                              #
+####################################################################################################
+
+
+# class Client2:
+#     def __init__(self, src: str, dst: str, max_conn: int) -> None:
+#         super().__init__(daemon=True)
+
+#         self.src = src
+#         self.dst = dst
+#         self.host = ''
+#         self.port = 0
+
+#         self.max_conn = max_conn
+#         self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
+#         self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
+#         self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
+
+#     def parse_args(self):
+#         if ':' in self.src:
+#             netloc, path = self.src.split(':')
+#         elif ':' in self.dst:
+#             pass
+#         else:
+#             raise ValueError
+
+#     def run(self):
+#         pass
+
+
 if __name__ == '__main__':
     parser = ArgumentParser(
         prog='fcp',
@@ -64,7 +89,12 @@ if __name__ == '__main__':
             PUSH : fcp [-p PORT] SRC [USER@]HOST:DST
         ''')
     )
-    parser.add_argument('-p', dest='port', default=7325, help='server port (default: 7325)')
+    parser.add_argument('-p', dest='port', default=7325,
+                        help='server port (default: 7325)')
+
+    parser.add_argument('-n', dest='num', default=16,
+                        help='maximum number of connections (default: 16)')
+
     parser.add_argument(dest='src', help='source path')
     parser.add_argument(dest='dst', help='destination path')
     main(parser)
