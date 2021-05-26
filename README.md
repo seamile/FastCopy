@@ -8,7 +8,7 @@
 
 ### 1. 报文统一格式
 
-| type  | chksum | length | payload |
+| flag  | chksum | length | payload |
 | :---: | :----: | :----: | :-----: |
 |  1B   |   4B   |   2B   |   ...   |
 
@@ -30,7 +30,7 @@
 
     连接建立后，客户端首先需要向服务器申请 *拉取* 或 *推送*，并将 *目的路径* 传给服务器
 
-    - 拉取、推送的标识由 `type` 字段决定
+    - 拉取、推送的标识由 `flag` 字段决定
     - 方向: Client -> Server
     - Payload 格式为:
 

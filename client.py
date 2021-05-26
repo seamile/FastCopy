@@ -1,26 +1,21 @@
 #!/usr/bin/env python
 import sys
-from typing import Dict, Tuple
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from textwrap import dedent
 from threading import Thread
+from typing import Dict, Tuple
 
-from const import Flag, Role
+from const import Flag
 from network import NetworkMixin
 from filemanage import Reader, Writer
 
 
-class Porter(Thread, NetworkMixin):
-    def __init__(self, addr: Tuple[str, int]) -> None:
-        super().__init__(daemon=True)
-        self.addr = addr
-
-
 class Client:
-    def __init__(self, host: str, port: int, role: Role, loc_path: str, rem_path: str) -> None:
+    def __init__(self, host: str, port: int, loc_path: str, rem_path: str) -> None:
         self.addr = (host, port)
-        self.role = role
         self.loc_path = loc_path
         self.rem_path = rem_path
-        self.workers: Dict[int, Porter] = {}
+        # self.workers: Dict[int, ] = {}
 
     def run_as_sender(self):
         '''作为发送端端运行'''
@@ -39,27 +34,37 @@ class Client:
         fst_sock.send()
 
 
-def main(arg1: str, arg2: str):
-    if ':' in arg1:
-        role = Role.Receiver
-        print(f'Run as {role.name}.')
-        local_dir = arg2
-        host, dst_dir = arg1.split(':')
+def main(parser: ArgumentParser):
+    args = parser.parse_args()
+    port = args.port
 
-    elif ':' in arg2:
-        role = Role.Sender
-        print(f'Run as {role.name}.')
+    if ':' in args.src:
+        netloc, src = args.src.split(':')
+        user, host = netloc.split('@')
+        dst = args.dst
+        print(f'PULL: {user}@{host}:{port}:{src} -> {dst}')
+
+    elif ':' in args.dst:
+        netloc, dst = args.dst.split(':')
+        user, host = netloc.split('@')
+        src = args.src
+        print(f'PUSH: {src} -> {user}@{host}:{port}:{dst}')
 
     else:
-        print('Usage: fcp SRC DST')
+        parser.print_help()
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print('Usage:fcp SRC DST')
-        sys.exit(1)
-    else:
-        # fcp ./ root@firefly:/xx/yy
-        arg1, arg2 = sys.argv[1:3]
-        main(arg1, arg2)
+    parser = ArgumentParser(
+        prog='fcp',
+        formatter_class=RawDescriptionHelpFormatter,
+        description=dedent('''
+            PULL : fcp [-p PORT] [USER@]HOST:SRC DST
+            PUSH : fcp [-p PORT] SRC [USER@]HOST:DST
+        ''')
+    )
+    parser.add_argument('-p', dest='port', default=7325, help='server port (default: 7325)')
+    parser.add_argument(dest='src', help='source path')
+    parser.add_argument(dest='dst', help='destination path')
+    main(parser)

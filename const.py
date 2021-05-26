@@ -23,12 +23,12 @@ class PacketSnippet(IntEnum):
 
 
 class Flag(IntEnum):
-    PUSH = 0x01  # 推送申请
-    PULL = 0x02  # 拉取申请
-    SID = 0x03  # 建立会话
-    ATTACH = 0x04  # 后续连接
-    FILE_COUNT = 0x05  # 文件总量
-    FILE_INFO = 0x06  # 文件信息
-    FILE_READY = 0x07  # 文件就绪
-    FILE_CHUNK = 0x08  # 数据传输
-    ERROR = 0x09  # 错误回传
+    PUSH = 1        # 推送申请
+    PULL = 2        # 拉取申请
+    SID = 3         # 建立会话
+    ATTACH = 4      # 后续连接
+    FILE_COUNT = 5  # 文件总量
+    FILE_INFO = 6   # 文件信息
+    FILE_READY = 7  # 文件就绪
+    FILE_CHUNK = 8  # 数据传输
+    ERROR = 9       # 错误回传

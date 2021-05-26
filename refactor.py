@@ -110,10 +110,11 @@ class WatchDog(Thread, NetworkMixin):
 @singleton
 class Server(Thread):
 
-    def __init__(self, host: str, port: int, max_workers=256) -> None:
+    def __init__(self, host: str, port: int, max_conn=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
-        self.max_workers = max_workers
+        self.max_workers = 65535  # 最大 Worker 数量，与 Session ID 相关
+        self.max_conn = max_conn  # 一个 Worker 的最大连接数
         self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
@@ -163,6 +164,33 @@ class Server(Thread):
 ####################################################################################################
 
 
-class Client:
-    def __init__(self) -> None:
+class Client(Thread):
+    def __init__(self, src: str, dst: str, max_conn: int) -> None:
+        super().__init__(daemon=True)
+
+        self.src = src
+        self.dst = dst
+        self.host = ''
+        self.port = 0
+
+        self.max_conn = max_conn
+        self.send_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.recv_q: Queue[Packet] = Queue(QUEUE_SIZE)
+        self.conn_pool = ConnectionPool(self.send_q, self.recv_q)
+
+    def parse_args(self):
+        if ':' in self.src:
+            netloc, path = self.src.split(':')
+        elif ':' in self.dst:
+            pass
+        else:
+            raise ValueError
+
+    def run(self):
         pass
+
+
+if __name__ == '__main__':
+    # Server 启动方式: fcpd -h host -p port -w 256 -c 128
+    # Client 启动方式: fcp -c 100 host:/foo/bar ./loc/
+    pass

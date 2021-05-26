@@ -230,7 +230,11 @@ class Writer(Thread):
     def handle_file_chunk(self, packet: Packet):
         '''处理文件数据块'''
         file_id, seq, chunk = packet.unpack_body()
-        self.iwriters[file_id].send((seq, chunk))
+        try:
+            self.iwriters[file_id].send((seq, chunk))
+        except StopIteration:
+            # 文件写入完成
+            self.n_finished += 1
 
     def run(self):
         # 等待接收文件总数
@@ -244,7 +248,7 @@ class Writer(Thread):
         self.check_dst_path()
 
         # 等待接收文件信息和数据
-        while True:
+        while self.n_finished == self.n_files:
             packet = self.input_q.get()
             if packet.flag == Flag.FILE_INFO:
                 self.handle_file_info(packet)
@@ -253,4 +257,4 @@ class Writer(Thread):
                 self.handle_file_chunk(packet)
 
             else:
-                raise ValueError(packet.flag)
+                raise ValueError(f'Unknow packet flag: {packet.flag}')
