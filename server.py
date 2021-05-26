@@ -8,7 +8,7 @@ from threading import Lock, Thread
 from typing import Dict
 
 from const import Flag
-from network import NetworkMixin
+from network import NetworkMixin, Packet
 from transfer import Sender, Receiver, Transfer
 
 
@@ -47,16 +47,20 @@ class WatchDog(Thread, NetworkMixin):
             return
 
         if cli_flag == Flag.PULL or cli_flag == Flag.PUSH:
+            # 创建 Transfer
             dst_path = payload.decode('utf8')
-            worker = self.server.create_worker(cli_flag, dst_path)
-            worker.conn_pool.add(self.sock)
-            worker.start()
+            transfer = self.server.create_transfer(cli_flag, dst_path)
+            transfer.conn_pool.add(self.sock)
+            transfer.start()
+
+            # 将 SID 发送给客户端
+            self.send_msg(Flag.SID, transfer.sid)
 
         elif cli_flag == Flag.ATTACH:
             print('run as a follower')
             sid = unpack('>H', payload)[0]
-            worker = self.server.workers[sid]
-            worker.conn_pool.add(self.sock)
+            transfer = self.server.transfers[sid]
+            transfer.conn_pool.add(self.sock)
 
         else:
             # 对于错误的类型，直接关闭连接
@@ -69,42 +73,42 @@ class Server(Thread):
     def __init__(self, host: str, port: int, max_conn=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
-        self.max_workers = 65535  # 最大 Transfer 数量，与 Session ID 相关
+        self.max_transfers = 65535  # 最大 Transfer 数量，与 Session ID 相关
         self.max_conn = max_conn  # 一个 Transfer 的最大连接数
         self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
-        self.workers: Dict[int, Transfer] = {}
+        self.transfers: Dict[int, Transfer] = {}
 
     def geneate_sid(self) -> int:
         with self.mutex:
-            if len(self.workers) >= self.max_workers:
+            if len(self.transfers) >= self.max_transfers:
                 raise ValueError('已达到最大 Transfer 数量，无法创建')
 
-            while self.next_id in self.workers:
-                if self.next_id < self.max_workers:
+            while self.next_id in self.transfers:
+                if self.next_id < self.max_transfers:
                     self.next_id += 1
                 else:
                     self.next_id = 1
             else:
                 return self.next_id
 
-    def create_worker(self, cli_flag: Flag, dst_path: str) -> Transfer:
+    def create_transfer(self, cli_flag: Flag, dst_path: str) -> Transfer:
         '''创建新 Transfer'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
             print(f'Create Sender({sid}, {dst_path})')
-            self.workers[sid] = Sender(sid, dst_path)
+            self.transfers[sid] = Sender(sid, dst_path)
         else:
             print(f'Create Receiver({sid}, {dst_path})')
-            self.workers[sid] = Receiver(sid, dst_path)
-        return self.workers[sid]
+            self.transfers[sid] = Receiver(sid, dst_path)
+        return self.transfers[sid]
 
-    def close_all_workers(self):
+    def close_all_transfers(self):
         '''关闭所有 Transfer'''
-        print('closing workers')
-        for worker in self.workers.values():
-            worker.close()
+        print('closing transfers')
+        for transfer in self.transfers.values():
+            transfer.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)

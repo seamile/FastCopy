@@ -213,12 +213,11 @@ class NetworkMixin:
         self.sock.recv_into(buffer, length, socket.MSG_WAITALL)
         return buffer
 
-    def send_msg(self, flag: Flag, payload: bytes):
+    def send_msg(self, flag: Flag, *args):
         '''发送数据报文'''
-        chksum = crc32(payload)
-        length = len(payload)
-        fmt = f'>BIH{length}s'
-        return pack(fmt, flag, chksum, length, payload)
+        packet = Packet.load(flag, *args)
+        datagram = packet.pack()
+        self.sock.send(datagram)
 
     def recv_msg(self):
         '''接收数据报文'''
