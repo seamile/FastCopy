@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import socket
+from argparse import ArgumentParser
 from functools import wraps
 from struct import unpack
 from threading import Lock, Thread
@@ -35,11 +36,13 @@ class WatchDog(Thread, NetworkMixin):
     def run(self):
         try:
             # 等待接收新连接的第一个数据报文
+            print('waiting for the first packet from %s:%d' % self.sock.getpeername())
             self.sock.settimeout(10)
             cli_flag, *_, payload = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
+            print('waiting timeout')
             self.sock.close()
             return
 
@@ -63,7 +66,6 @@ class WatchDog(Thread, NetworkMixin):
 
 @singleton
 class Server(Thread):
-
     def __init__(self, host: str, port: int, max_conn=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
@@ -91,20 +93,25 @@ class Server(Thread):
         '''创建新 Transfer'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
+            print(f'Create Sender({sid}, {dst_path})')
             self.workers[sid] = Sender(sid, dst_path)
         else:
+            print(f'Create Receiver({sid}, {dst_path})')
             self.workers[sid] = Receiver(sid, dst_path)
         return self.workers[sid]
 
     def close_all_workers(self):
         '''关闭所有 Transfer'''
+        print('closing workers')
         for worker in self.workers.values():
             worker.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
+        print('Server is running at %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
+            print('waitting for new connections')
             cli_sock, cli_addr = self.srv_sock.accept()
             print('new connection: %s:%s' % cli_addr)
 
@@ -114,6 +121,15 @@ class Server(Thread):
 
 
 if __name__ == '__main__':
-    # Server 启动方式: fcpd -h host -p port -w 256 -c 128
-    # Client 启动方式: fcp -c 100 host:/foo/bar ./loc/
-    pass
+    # Server 启动方式: fcpd -h host -p port -c 128
+    parser = ArgumentParser()
+    parser.add_argument('-b', dest='bind', type=str, default='0.0.0.0',
+                        help='')
+    parser.add_argument('-p', dest='port', type=int, default=7325,
+                        help='')
+    parser.add_argument('-c', dest='concurrency', type=int, default=256,
+                        help='')
+    args = parser.parse_args()
+    server = Server(args.bind, args.port, args.concurrency)
+    server.start()
+    server.join()
