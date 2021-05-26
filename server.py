@@ -1,167 +1,119 @@
 #!/usr/bin/env python
 
 import socket
+from functools import wraps
 from struct import unpack
-from threading import Thread, Lock
-from typing import AnyStr, Dict, List, Optional, Tuple, Union
+from threading import Lock, Thread
+from typing import Dict
 
-from const import Flag, Role
-from filemanage import Reader, Writer
+from const import Flag
 from network import NetworkMixin
+from transfer import Sender, Receiver, Transfer
 
 
-class Session:
-    def __init__(self, session_id: int, role: Role, dst_path: AnyStr) -> None:
-        self.id = session_id
-        self.role = role
-        self.dst_path = dst_path  # type: Union[str, bytes]
+def singleton(cls):
+    '''Singleton Pattern Decorator'''
+    obj = None
 
-        self.file_man: Union[Reader, Writer, None] = None
-        self.workers: List['Worker'] = []
-
-    def launch_reader(self):
-        '''启动 Reader'''
-        self.file_man = Reader(self.dst_path)
-        self.file_man.start()
-
-    def launch_writer(self):
-        '''启动 Writer'''
-        self.file_man = Writer()
-        self.file_man.start()
+    @wraps(cls)
+    def wrapper(*args, **kwargs):
+        nonlocal obj
+        if isinstance(obj, cls):
+            return obj
+        else:
+            obj = cls(*args, **kwargs)
+            return obj
+    return wrapper
 
 
-class SessionManager:
-    '''会话管理器 (单例)'''
-    manager = None
+class WatchDog(Thread, NetworkMixin):
+    def __init__(self, server: 'Server', sock: socket.socket):
+        super().__init__(daemon=True)
+        self.server = server
+        self.sock = sock
 
-    def __new__(cls) -> 'SessionManager':
-        if cls.manager is None:
-            cls.manager = object.__new__(cls)
-        return cls.manager
+    def run(self):
+        try:
+            # 等待接收新连接的第一个数据报文
+            self.sock.settimeout(10)
+            cli_flag, *_, payload = self.recv_msg()
+            self.sock.settimeout(None)
+        except socket.timeout:
+            # 超时退出
+            self.sock.close()
+            return
 
-    def __init__(self, max_session: int = 1024) -> None:
-        self.max_session = max_session
-        self.sessions: Dict[int, Session] = {}
+        if cli_flag == Flag.PULL or cli_flag == Flag.PUSH:
+            dst_path = payload.decode('utf8')
+            worker = self.server.create_worker(cli_flag, dst_path)
+            worker.conn_pool.add(self.sock)
+            worker.start()
+
+        elif cli_flag == Flag.ATTACH:
+            print('run as a follower')
+            sid = unpack('>H', payload)[0]
+            worker = self.server.workers[sid]
+            worker.conn_pool.add(self.sock)
+
+        else:
+            # 对于错误的类型，直接关闭连接
+            print('close conn')
+            self.sock.close()
+
+
+@singleton
+class Server(Thread):
+
+    def __init__(self, host: str, port: int, max_conn=256) -> None:
+        super().__init__(daemon=True)
+        self.addr = (host, port)
+        self.max_workers = 65535  # 最大 Transfer 数量，与 Session ID 相关
+        self.max_conn = max_conn  # 一个 Transfer 的最大连接数
+        self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
+        self.workers: Dict[int, Transfer] = {}
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close_all_sessions()
-
-    def new_id(self) -> int:
+    def geneate_sid(self) -> int:
         with self.mutex:
-            if len(self.sessions) >= 1024:
-                raise ValueError('已达到最大 Session 数量，无法创建')
+            if len(self.workers) >= self.max_workers:
+                raise ValueError('已达到最大 Transfer 数量，无法创建')
 
-            while self.next_id in self.sessions:
-                if self.next_id < self.max_session:
+            while self.next_id in self.workers:
+                if self.next_id < self.max_workers:
                     self.next_id += 1
                 else:
                     self.next_id = 1
             else:
                 return self.next_id
 
-    def new_session(self, role: Role, dst_path: AnyStr) -> Session:
-        session_id = self.new_id()
-        session = Session(session_id, role, dst_path)
-        return session
-
-    def get_session(self, session_id: int) -> Session:
-        return self.sessions[session_id]
-
-    def del_session(self, session_id: int):
-        return self.sessions.pop(session_id)
-
-    def close_all_sessions(self):
-        pass
-
-
-class Worker(Thread, NetworkMixin):
-    def __init__(self, sock: socket.socket, addr: Tuple[str, int]):
-        super().__init__(daemon=True)
-        self.name = 'Worker-%s:%s' % addr
-        self.sock = sock
-        self.addr = addr
-        self.sub_thread: Optional[Thread] = None
-        self.session: Optional[Session] = None
-
-    def bind_session(self, session: Session):
-        self.session = session
-        session.workers.append(self)
-
-    def listen_for_sender(self):
-        while True:
-            flag, *_, pkg = self.recv_msg()
-            self.session.file_man.input_q.put((flag, pkg))
-
-    def run_as_sender(self):
-        '''作为文件发送端运行'''
-        # 启动监听子线程
-        self.sub_thread = Thread(target=self.listen_for_sender)
-        self.sub_thread.start()
-
-        # 从文件读取队列获取数据，并发送到接收端
-        while True:
-            flag, payload = self.session.file_man.output_q.get()
-            self.send_msg(flag, payload)
-
-    def run_as_receiver(self):
-        '''作为文件接收端运行'''
-        while True:
-            flag, *_, payload = self.recv_msg()
-            self.session.file_man.input_q.put(flag, payload)
-
-    def run(self) -> None:
-        print(f'{self.name} is running')
-        s_manager = SessionManager()
-        flag, *_, datagram = self.recv_msg()
-        print(f'Received {flag.name} msg')
-
-        if flag == Flag.PULL:
-            # 服务端作为发送端运行
-            print(f'{self.name} run as a sender')
-            session = s_manager.new_session(Role.Sender, datagram)
-            self.bind_session(session)
-            self.run_as_sender()
-
-        elif flag == Flag.PUSH:
-            # 服务端作为接收端运行
-            print(f'{self.name} run as a receiver')
-            session = s_manager.new_session(Role.Receiver, datagram)
-            self.bind_session(session)
-            self.run_as_receiver()
-
-        elif flag == Flag.ATTACH:
-            # 将后续连接加入对应会话
-            print(f'{self.name} run as a follower')
-            session_id = unpack('>H', datagram)[0]
-            session = s_manager.get_session(session_id)
-            self.bind_session(session)
-
-            if session.role is Role.Sender:
-                self.run_as_sender()
-            else:
-                self.run_as_receiver()
-
+    def create_worker(self, cli_flag: Flag, dst_path: str) -> Transfer:
+        '''创建新 Transfer'''
+        sid = self.geneate_sid()
+        if cli_flag == Flag.PULL:
+            self.workers[sid] = Sender(sid, dst_path)
         else:
-            raise TypeError('连接报文类型错误')
+            self.workers[sid] = Receiver(sid, dst_path)
+        return self.workers[sid]
 
+    def close_all_workers(self):
+        '''关闭所有 Transfer'''
+        for worker in self.workers.values():
+            worker.close()
 
-def main(host: str = '0.0.0.0', port: int = 7323, backlog: int = 2048):
-    addr = (host, port)
-    sock = socket.create_server(addr, backlog=backlog, reuse_port=True)
-    print(f'Listen to {host}:{port}')
+    def run(self):
+        self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
+        while self.is_running:
+            # wait for new connection
+            cli_sock, cli_addr = self.srv_sock.accept()
+            print('new connection: %s:%s' % cli_addr)
 
-    with SessionManager():
-        while True:
-            cli_sock, cli_addr = sock.accept()
-            print('Accept client %s:%d' % cli_addr)
-            worker = Worker(cli_sock, cli_addr)
-            worker.start()
+            # launch a WatchDog for handshake
+            dog = WatchDog(self, cli_sock)
+            dog.start()
 
 
 if __name__ == '__main__':
-    main()
+    # Server 启动方式: fcpd -h host -p port -w 256 -c 128
+    # Client 启动方式: fcp -c 100 host:/foo/bar ./loc/
+    pass
