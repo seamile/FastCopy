@@ -6,7 +6,7 @@ from queue import Queue
 from threading import Thread
 from typing import Dict, Generator, NamedTuple, Tuple
 
-from const import CHUNK_SIZE, EOF, Flag
+from const import CHUNK_SIZE, Flag
 from network import Packet
 
 
@@ -19,7 +19,7 @@ class FileInfo(NamedTuple):
     mtime: float
     atime: float
     chksum: bytes
-    relpath: Path  # 文件的相对路径
+    relpath: bytes  # 文件的相对路径
 
     @property
     def n_chunks(self):
@@ -29,13 +29,14 @@ class FileInfo(NamedTuple):
     def load(cls, file_id: int, filepath: Path, dirpath: Path):
         # 读取文件状态信息
         stat = os.stat(filepath)
-        perm = stat.st_mode                      # 权限, 2 Bytes
-        size = stat.st_size                      # 大小, 8 Bytes
-        ctime = stat.st_ctime                    # 创建时间, 8 Bytes
-        mtime = stat.st_mtime                    # 修改时间, 8 Bytes
-        atime = stat.st_atime                    # 访问时间, 8 Bytes
-        chksum = cls.filehash(filepath)          # 文件 MD5 校验码
-        relpath = filepath.relative_to(dirpath)  # 计算相对路径
+        perm = stat.st_mode              # 权限, 2 Bytes
+        size = stat.st_size              # 大小, 8 Bytes
+        ctime = stat.st_ctime            # 创建时间, 8 Bytes
+        mtime = stat.st_mtime            # 修改时间, 8 Bytes
+        atime = stat.st_atime            # 访问时间, 8 Bytes
+        chksum = cls.filehash(filepath)  # 文件 MD5 校验码
+        # 计算相对路径
+        relpath = str(filepath.relative_to(dirpath)).encode('utf-8')
         return cls(file_id, perm, size, ctime, mtime, atime, chksum, relpath)
 
     @staticmethod
@@ -47,7 +48,7 @@ class FileInfo(NamedTuple):
         return hasher.digest()
 
     def fullpath(self, dirpath: Path):
-        return dirpath.joinpath(self.relpath).absolute()
+        return dirpath.joinpath(self.relpath.decode('utf-8')).absolute()
 
 
 class Reader(Thread):
@@ -82,9 +83,15 @@ class Reader(Thread):
             for dirname, _, filenames in os.walk(self.src_path):
                 directory = Path(dirname)
                 for filename in filenames:
-                    self.files[file_id] = directory.joinpath(filename)  # 记录文件路径
-                    file_id += 1  # File ID 自增
-            self.n_files = file_id + 1
+                    filepath = directory.joinpath(filename)
+                    if filepath.is_file() or filepath.is_dir():
+                        print(f'find file {file_id}: {filepath}')
+                        self.files[file_id] = filepath  # 记录文件路径
+                        file_id += 1  # File ID 自增
+
+            # 记录文件总数
+            self.n_files = file_id
+            print(f'files num: {self.n_files}')
 
         elif self.src_path.is_file():
             # 目标路径是单文件，直接加入文件列表
@@ -113,10 +120,11 @@ class Reader(Thread):
         with open(self.files[file_id], 'rb') as fp:
             seq = 0
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
+                print(f'read: {Flag.FILE_CHUNK=}  {file_id=}  {seq=}')
                 yield Packet.load(Flag.FILE_CHUNK, file_id, seq, chunk)
                 seq += 1
-            else:
-                yield Packet.load(Flag.FILE_CHUNK, file_id, EOF, b'')
+            # else:
+            #     yield Packet.load(Flag.FILE_CHUNK, file_id, EOF, b'')
 
     def run(self):
         # 整理所有文件
@@ -140,6 +148,9 @@ class Reader(Thread):
             for packet in self.iread(f_id):
                 self.output_q.put(packet)
             finished += 1
+            print(f'finished: {finished}')
+        else:
+            print('all files finished')
 
 
 class Writer(Thread):
@@ -166,10 +177,15 @@ class Writer(Thread):
 
     @staticmethod
     def make_empty_file(file_path: str, file_size: int):
+        print(f'make file: {file_path}')
         block_size = 1024 * 1024  # 一次写入的块大小，默认为 1Mb
         count, remain = divmod(file_size, block_size)
         chunk = b'\x00' * block_size
         ending = b'\x00' * remain
+
+        # 创建文件所在目录
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        # 创建空文件
         with open(file_path, 'wb') as dst_fp:
             for _ in range(count):
                 dst_fp.write(chunk)
@@ -183,6 +199,7 @@ class Writer(Thread):
             while seqs:
                 seq, chunk = yield
                 if seq in seqs:
+                    print(f'write: {filepath=} {seq=}')
                     fp.seek(seq * CHUNK_SIZE)
                     fp.write(chunk)
                     seqs.remove(seq)
@@ -211,17 +228,15 @@ class Writer(Thread):
     def handle_file_info(self, packet: Packet):
         '''处理文件信息报文'''
         # 解包，并创建 FileInfo 对象
-        fid, perm, size, ctime, mtime, atime, chksum, relpath = packet.unpack_body()
-        relpath = Path(relpath.decode('utf8'))
-        f_info = FileInfo(fid, perm, size, ctime, mtime, atime, chksum, relpath)
+        f_info = FileInfo(*packet.unpack_body())
 
         # 创建空文件
         full_path = f_info.fullpath(self.dst_dir)
         self.make_empty_file(full_path, f_info.size)
 
         # 创建并启动写入迭代器
-        self.iwriters[fid] = self.iwrite(full_path, f_info.n_chunks)
-        self.iwriters[fid].send(None)
+        self.iwriters[f_info.fid] = self.iwrite(full_path, f_info.n_chunks)
+        self.iwriters[f_info.fid].send(None)
 
         # 创建文件准备就绪报文
         ready_pkt = Packet.load(Flag.FILE_READY, f_info.fid)
@@ -231,6 +246,7 @@ class Writer(Thread):
         '''处理文件数据块'''
         file_id, seq, chunk = packet.unpack_body()
         try:
+            print(f'write file: {file_id=} {seq=}')
             self.iwriters[file_id].send((seq, chunk))
         except StopIteration:
             # 文件写入完成
@@ -248,7 +264,7 @@ class Writer(Thread):
         self.check_dst_path()
 
         # 等待接收文件信息和数据
-        while self.n_finished == self.n_files:
+        while self.n_finished < self.n_files:
             packet = self.input_q.get()
             if packet.flag == Flag.FILE_INFO:
                 self.handle_file_info(packet)
@@ -258,3 +274,5 @@ class Writer(Thread):
 
             else:
                 raise ValueError(f'Unknow packet flag: {packet.flag}')
+        else:
+            print('all file finished')

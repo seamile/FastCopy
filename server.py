@@ -3,7 +3,6 @@
 import socket
 from argparse import ArgumentParser
 from functools import wraps
-from struct import unpack
 from threading import Lock, Thread
 from typing import Dict
 
@@ -38,7 +37,7 @@ class WatchDog(Thread, NetworkMixin):
             # 等待接收新连接的第一个数据报文
             print('waiting for the first packet from %s:%d' % self.sock.getpeername())
             self.sock.settimeout(10)
-            cli_flag, *_, payload = self.recv_msg()
+            packet = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
@@ -46,21 +45,20 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.close()
             return
 
-        if cli_flag == Flag.PULL or cli_flag == Flag.PUSH:
+        if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
             # 创建 Transfer
-            dst_path = payload.decode('utf8')
-            transfer = self.server.create_transfer(cli_flag, dst_path)
+            dst_path, = packet.unpack_body()
+            transfer = self.server.create_transfer(packet.flag, dst_path)
             transfer.conn_pool.add(self.sock)
             transfer.start()
 
             # 将 SID 发送给客户端
             self.send_msg(Flag.SID, transfer.sid)
 
-        elif cli_flag == Flag.ATTACH:
+        elif packet.flag == Flag.ATTACH:
             print('run as a follower')
-            sid = unpack('>H', payload)[0]
-            transfer = self.server.transfers[sid]
-            transfer.conn_pool.add(self.sock)
+            sid, = packet.unpack_body()
+            self.server.transfers[sid].conn_pool.add(self.sock)
 
         else:
             # 对于错误的类型，直接关闭连接

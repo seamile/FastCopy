@@ -25,15 +25,15 @@ class Client(NetworkMixin):
         self.sock: Optional[socket] = None  # type: ignore
         self.transfer: Optional[Transfer] = None
 
-    def handshake(self, flag: Flag, remote_dir: str):
+    def handshake(self, flag: Flag, remote_path: str):
         '''握手'''
-        self.send_msg(flag, remote_dir.encode('utf8'))
+        self.send_msg(flag, remote_path)
         packet = self.recv_msg()
         self.sid, = packet.unpack_body()
 
     def parse_remote(self, remote):
         netloc, path = remote.split(':')
-        user, host = netloc.split('@') if '@' in netloc else '', netloc
+        user, host = netloc.split('@') if '@' in netloc else ('', netloc)
         return user, host, path
 
     def init_conn(self):

@@ -25,7 +25,7 @@ class Packet(NamedTuple):
     def load(flag: Flag, *args) -> 'Packet':
         '''将包体封包'''
         if flag == Flag.PULL or flag == Flag.PUSH:
-            body = str(args[0]).encode('utf8')
+            body = args[0] if isinstance(args[0], bytes) else str(args[0]).encode('utf8')
         elif flag == Flag.SID or flag == Flag.ATTACH:
             body = pack('>H', *args)
         elif flag == Flag.FILE_COUNT:
@@ -56,7 +56,7 @@ class Packet(NamedTuple):
     def unpack_body(self) -> Tuple[Any, ...]:
         '''将 body 解包'''
         if self.flag == Flag.PULL or self.flag == Flag.PUSH:
-            return (self.body.decode('utf8'),)  # dest path
+            return (self.body.decode('utf-8'),)  # dest path
 
         elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
             return unpack('>H', self.body)  # Worker ID
@@ -136,9 +136,10 @@ class ConnectionPool:
 
     def parse_body(self, buf: Buffer):
         '''解析 body'''
-        pkt = Packet(buf.flag, buf.data)
+        pkt = Packet(buf.flag, bytes(buf.data))
         # 检查校验码
         if pkt.is_valid(buf.chksum):
+            # print(f'< {pkt}')
             self.recv_q.put(pkt)  # 正确的数据包放入队列
         else:
             print('错误的包，丢弃')
@@ -151,12 +152,16 @@ class ConnectionPool:
         while self.is_working:
             try:
                 packet = self.send_q.get(timeout=3)
+                # print(f'> {packet}')
             except Empty:
                 continue  # 队列为空，直接进入下轮循环
             else:
                 for key, _ in self.sender.select(timeout=3):
                     msg = packet.pack()
-                    key.fileobj.send(msg)
+                    try:
+                        key.fileobj.send(msg)
+                    except ConnectionResetError:
+                        self.remove(key.fileobj)
                     break
                 else:
                     # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
@@ -167,7 +172,11 @@ class ConnectionPool:
         while self.is_working:
             for key, _ in self.receiver.select(timeout=3):
                 sock, buf = key.fileobj, key.data
-                data = sock.recv(buf.remain)
+                try:
+                    data = sock.recv(buf.remain)
+                except ConnectionResetError:
+                    self.remove(sock)  # 关闭连接
+                    break
 
                 if data:
                     buf.remain -= len(data)  # 更新剩余长度
@@ -201,6 +210,9 @@ class ConnectionPool:
         self.sender.close()
         self.receiver.close()
 
+        for t in self.threads:
+            t.join()
+
 
 class NetworkMixin:
     def connect(self, server_addr: Tuple[str, int]):
@@ -217,12 +229,14 @@ class NetworkMixin:
         '''发送数据报文'''
         packet = Packet.load(flag, *args)
         datagram = packet.pack()
+        print(b'> %s' % datagram)
         self.sock.send(datagram)
 
     def recv_msg(self) -> Packet:
         '''接收数据报文'''
         # 接收并解析 head 部分
         head = self.recv_all(LEN_HEAD)
+        print(b'< head: %s' % head)
         flag, chksum, len_body = Packet.unpack_head(head)
 
         if not Flag.contains(flag):
@@ -230,6 +244,7 @@ class NetworkMixin:
 
         # 接收 body 部分
         body = self.recv_all(len_body)
+        print(b'< body: %s' % body)
 
         # 错误重传
         if crc32(body) != chksum:

@@ -22,9 +22,8 @@ class Sender(Thread):
         self.conn_pool.launch()  # 启动网络连接池
         self.reader.start()  # 启动读取线程
 
-        for t in self.conn_pool.threads:
-            t.join()
         self.reader.join()
+        self.conn_pool.close_all()
 
 
 class Receiver(Thread):
@@ -42,18 +41,8 @@ class Receiver(Thread):
         self.conn_pool.launch()  # 启动连接池
         self.writer.start()  # 启动写入线程
 
-        for t in self.conn_pool.threads:
-            t.join()
         self.writer.join()
-
-    def close(self):
-        '''关闭所有连接'''
         self.conn_pool.close_all()
-        self.writer.start()
-
-        self.writer.join()
-        for t in self.conn_pool.threads:
-            t.join()
 
 
 Transfer = Union[Sender, Receiver]
