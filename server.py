@@ -8,7 +8,7 @@ from threading import Lock, Thread
 from typing import Dict
 
 from const import Flag
-from network import NetworkMixin, Packet
+from network import NetworkMixin
 from transfer import Sender, Receiver, Transfer
 
 

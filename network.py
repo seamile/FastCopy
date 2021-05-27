@@ -219,22 +219,22 @@ class NetworkMixin:
         datagram = packet.pack()
         self.sock.send(datagram)
 
-    def recv_msg(self):
+    def recv_msg(self) -> Packet:
         '''接收数据报文'''
-        head = self.recv_all(7)
-        flag, chksum, length = unpack('>BIH', head)
-        try:
-            flag = Flag(flag)
-        except (ValueError, TypeError):
-            # TODO: 更好的错误处理
-            print('flag error')
-            return Flag.ERROR, 0, 0, b''
+        # 接收并解析 head 部分
+        head = self.recv_all(LEN_HEAD)
+        flag, chksum, len_body = Packet.unpack_head(head)
 
-        payload = self.recv_all(length)
+        if not Flag.contains(flag):
+            raise ValueError('unknow flag: %d' % flag)
+
+        # 接收 body 部分
+        body = self.recv_all(len_body)
 
         # 错误重传
-        # TODO: 不完善
-        if crc32(payload) != chksum:
+        if crc32(body) != chksum:
+            # TODO: 错误处理不够完善
             self.send_msg(Flag.ERROR, head)
+            raise ValueError
 
-        return Flag(flag), chksum, length, payload
+        return Packet(flag, body)
