@@ -2,12 +2,8 @@ from enum import Enum, IntEnum
 
 CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 30  # 全局超时时间
-QUEUE_SIZE = 256  # 队列大小
 
 LEN_HEAD = 7
-LEN_TYPE = 1
-LEN_CHKSUM = 4
-LEN_LENGTH = 2
 
 EOF = 0xffffffff
 

@@ -45,7 +45,7 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PULL, self.src)
-            self.transfer = Receiver(self.sid, self.dst)
+            self.transfer = Receiver(self.sid, self.dst, self.n_conn)
 
         elif ':' in self.dst:
             # 解析远程主机地址
@@ -54,7 +54,7 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PUSH, self.dst)
-            self.transfer = Sender(self.sid, self.src)
+            self.transfer = Sender(self.sid, self.src, self.n_conn)
 
         else:
             parser.print_help()
@@ -62,17 +62,18 @@ class Client(NetworkMixin):
 
         self.transfer.conn_pool.add(self.sock)
 
-    def create_parallel_connections(self, num):
+    def create_parallel_connections(self):
         '''创建并行连接'''
         attach_pkt = Packet.load(Flag.ATTACH, self.sid)
         datagram = attach_pkt.pack()
-        for i in range(self.n_conn - 1):
+        for _ in range(self.n_conn - 1):
             sock = create_connection((self.host, self.port))
             sock.send(datagram)
             self.transfer.conn_pool.add(sock)
 
     def launch(self):
         self.init_conn()
+        self.create_parallel_connections()
         self.transfer.start()
         self.transfer.join()
 

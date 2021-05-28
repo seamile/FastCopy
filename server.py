@@ -58,7 +58,8 @@ class WatchDog(Thread, NetworkMixin):
         elif packet.flag == Flag.ATTACH:
             print('run as a follower')
             sid, = packet.unpack_body()
-            self.server.transfers[sid].conn_pool.add(self.sock)
+            if not self.server.transfers[sid].conn_pool.add(self.sock):
+                self.sock.close()
 
         else:
             # 对于错误的类型，直接关闭连接
@@ -96,10 +97,10 @@ class Server(Thread):
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
             print(f'Create Sender({sid}, {dst_path})')
-            self.transfers[sid] = Sender(sid, dst_path)
+            self.transfers[sid] = Sender(sid, dst_path, self.max_conn)
         else:
             print(f'Create Receiver({sid}, {dst_path})')
-            self.transfers[sid] = Receiver(sid, dst_path)
+            self.transfers[sid] = Receiver(sid, dst_path, self.max_conn)
         return self.transfers[sid]
 
     def close_all_transfers(self):

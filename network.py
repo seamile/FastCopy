@@ -1,10 +1,10 @@
-import socket
 from binascii import crc32
 from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
+from socket import socket, create_connection, MSG_WAITALL
 from struct import pack, unpack
 from threading import Thread
-from typing import Any, List, NamedTuple, Tuple
+from typing import Any, List, NamedTuple, Set, Tuple
 
 from const import EOF, PacketSnippet, Flag, LEN_HEAD
 
@@ -113,21 +113,37 @@ class Buffer:
 
 
 class ConnectionPool:
-    def __init__(self, send_q: Queue[Packet], recv_q: Queue[Packet]) -> None:
-        self.send_q = send_q
-        self.recv_q = recv_q
+    def __init__(self, size: int = 256) -> None:
+        self.size = size
+        # 发送、接收队列
+        self.send_q: Queue[Packet] = Queue(size * 2)
+        self.recv_q: Queue[Packet] = Queue(size * 2)
+
+        # 所有 Socket
+        self.socks: Set[socket] = set()
+
+        # 发送、接收多路复用
         self.sender = DefaultSelector()
         self.receiver = DefaultSelector()
+
         self.is_working = True
         self.threads: List[Thread] = []
 
-    def add(self, sock: socket.socket):
-        self.sender.register(sock, EVENT_WRITE)
-        self.receiver.register(sock, EVENT_READ, Buffer())
+    def add(self, sock: socket):
+        '''添加 sock'''
+        if len(self.socks) < self.size:
+            self.sender.register(sock, EVENT_WRITE)
+            self.receiver.register(sock, EVENT_READ, Buffer())
+            self.socks.add(sock)
+            return True
+        else:
+            return False
 
-    def remove(self, sock: socket.socket):
+    def remove(self, sock: socket):
+        '''删除 sock'''
         self.sender.unregister(sock)
         self.receiver.unregister(sock)
+        self.socks.remove(sock)
         sock.close()
 
     def parse_head(self, buf: Buffer):
@@ -210,23 +226,22 @@ class ConnectionPool:
         for t in self.threads:
             t.join()
 
-        for key in list(self.sender.get_map().values()):
-            sock = key.fileobj
-            sock.close()
-
         self.sender.close()
         self.receiver.close()
+
+        for sock in self.socks:
+            sock.close()
 
 
 class NetworkMixin:
     def connect(self, server_addr: Tuple[str, int]):
         '''建立连接'''
-        self.sock = socket.create_connection(server_addr, timeout=30)
+        self.sock = create_connection(server_addr, timeout=30)
 
     def recv_all(self, length: int) -> bytearray:
         '''接收指定长度的完整数据'''
         buffer = bytearray(length)
-        self.sock.recv_into(buffer, length, socket.MSG_WAITALL)
+        self.sock.recv_into(buffer, length, MSG_WAITALL)
         return buffer
 
     def send_msg(self, flag: Flag, *args):

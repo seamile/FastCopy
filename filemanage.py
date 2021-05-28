@@ -242,6 +242,7 @@ class Writer(Thread):
         '''处理文件信息报文'''
         # 解包，并创建 FileInfo 对象
         f_info = FileInfo(*packet.unpack_body())
+        self.files[f_info.fid] = f_info
 
         # 创建空文件
         full_path = f_info.fullpath(self.dst_dir)
