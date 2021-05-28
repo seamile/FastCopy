@@ -23,7 +23,9 @@ class Sender(Thread):
         self.reader.start()  # 启动读取线程
 
         self.reader.join()
+        print('Reader exit')
         self.conn_pool.close_all()
+        print(f'Sender({self.sid}) exit')
 
 
 class Receiver(Thread):
@@ -42,7 +44,9 @@ class Receiver(Thread):
         self.writer.start()  # 启动写入线程
 
         self.writer.join()
+        print('Writer exit')
         self.conn_pool.close_all()
+        print(f'Receiver({self.sid}) exit')
 
 
 Transfer = Union[Sender, Receiver]

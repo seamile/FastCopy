@@ -6,7 +6,7 @@ from queue import Queue
 from threading import Thread
 from typing import Dict, Generator, NamedTuple, Tuple
 
-from const import CHUNK_SIZE, Flag
+from const import CHUNK_SIZE, EOF, Flag
 from network import Packet
 
 
@@ -120,7 +120,7 @@ class Reader(Thread):
         with open(self.files[file_id], 'rb') as fp:
             seq = 0
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
-                print(f'read: {Flag.FILE_CHUNK=}  {file_id=}  {seq=}')
+                print(f'read: FILE_CHUNK  {file_id=}  {seq=}')
                 yield Packet.load(Flag.FILE_CHUNK, file_id, seq, chunk)
                 seq += 1
             # else:
@@ -142,15 +142,22 @@ class Reader(Thread):
 
         # 将对端准备就绪的文件读入 output_q
         finished = 0
-        while finished < self.n_files:
+        while True:
             packet = self.input_q.get()
+            if packet.flag == Flag.FILE_READY:
+                f_id, = packet.unpack_body()
+                for chunk_packet in self.iread(f_id):
+                    self.output_q.put(chunk_packet)
+                finished += 1
+            elif packet.flag == Flag.DONE:
+                print('recv done')
+                break
+            else:
+                print(f'unknow packet: {packet}')
 
-            for packet in self.iread(f_id):
-                self.output_q.put(packet)
-            finished += 1
             print(f'finished: {finished}')
-        else:
-            print('all files finished')
+
+        print('all files finished')
 
 
 class Writer(Thread):
@@ -199,7 +206,6 @@ class Writer(Thread):
             while seqs:
                 seq, chunk = yield
                 if seq in seqs:
-                    print(f'write: {filepath=} {seq=}')
                     fp.seek(seq * CHUNK_SIZE)
                     fp.write(chunk)
                     seqs.remove(seq)
@@ -239,6 +245,7 @@ class Writer(Thread):
         self.iwriters[f_info.fid].send(None)
 
         # 创建文件准备就绪报文
+        print(f'File ready: id={f_info.fid} path={f_info.relpath.decode("utf8")}')
         ready_pkt = Packet.load(Flag.FILE_READY, f_info.fid)
         self.output_q.put(ready_pkt)
 
@@ -275,4 +282,5 @@ class Writer(Thread):
             else:
                 raise ValueError(f'Unknow packet flag: {packet.flag}')
         else:
+            self.output_q.put(Packet.load(Flag.DONE, EOF))
             print('all file finished')

@@ -6,7 +6,7 @@ from struct import pack, unpack
 from threading import Thread
 from typing import Any, List, NamedTuple, Tuple
 
-from const import PacketSnippet, Flag, LEN_HEAD
+from const import EOF, PacketSnippet, Flag, LEN_HEAD
 
 
 class Packet(NamedTuple):
@@ -38,6 +38,8 @@ class Packet(NamedTuple):
         elif flag == Flag.FILE_CHUNK:
             length = len(args[-1])
             body = pack(f'>HI{length}s', *args)
+        elif flag == Flag.DONE:
+            body = pack('>I', EOF)
         else:
             raise ValueError('Invalid flag')
         return Packet(flag, body)
@@ -78,6 +80,9 @@ class Packet(NamedTuple):
             #    2B   |  4B   |  ...
             fmt = f'>HI{self.length - 6}s'
             return unpack(fmt, self.body)
+
+        elif self.flag == Flag.DONE:
+            return unpack('>I', self.body)
 
         else:
             raise TypeError
@@ -139,7 +144,7 @@ class ConnectionPool:
         pkt = Packet(buf.flag, bytes(buf.data))
         # 检查校验码
         if pkt.is_valid(buf.chksum):
-            # print(f'< {pkt}')
+            print(f'< {pkt.flag.name}: length={pkt.length}')
             self.recv_q.put(pkt)  # 正确的数据包放入队列
         else:
             print('错误的包，丢弃')
@@ -151,12 +156,12 @@ class ConnectionPool:
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
             try:
-                packet = self.send_q.get(timeout=3)
-                # print(f'> {packet}')
+                packet = self.send_q.get(timeout=0.5)
             except Empty:
                 continue  # 队列为空，直接进入下轮循环
             else:
-                for key, _ in self.sender.select(timeout=3):
+                for key, _ in self.sender.select(timeout=0.5):
+                    print(f'> {packet.flag.name}: length={packet.length}')
                     msg = packet.pack()
                     try:
                         key.fileobj.send(msg)
@@ -170,7 +175,7 @@ class ConnectionPool:
     def recv(self):
         '''接收并解析数据包, 解析结果存入 recv_q 队列'''
         while self.is_working:
-            for key, _ in self.receiver.select(timeout=3):
+            for key, _ in self.receiver.select(timeout=1):
                 sock, buf = key.fileobj, key.data
                 try:
                     data = sock.recv(buf.remain)
@@ -201,17 +206,16 @@ class ConnectionPool:
 
     def close_all(self):
         '''关闭所有连接'''
-        with self.send_q.mutex:
-            self.is_working = False
-            for key in list(self.sender.get_map().values()):
-                sock = key.fileobj
-                sock.close()
+        self.is_working = False
+        for t in self.threads:
+            t.join()
+
+        for key in list(self.sender.get_map().values()):
+            sock = key.fileobj
+            sock.close()
 
         self.sender.close()
         self.receiver.close()
-
-        for t in self.threads:
-            t.join()
 
 
 class NetworkMixin:
