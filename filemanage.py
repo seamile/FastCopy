@@ -15,9 +15,7 @@ class FileInfo(NamedTuple):
     fid: int
     perm: int
     size: int
-    ctime: float
     mtime: float
-    atime: float
     chksum: bytes
     relpath: bytes  # 文件的相对路径
 
@@ -26,18 +24,25 @@ class FileInfo(NamedTuple):
         return ceil(self.size / CHUNK_SIZE)
 
     @classmethod
-    def load(cls, file_id: int, filepath: Path, dirpath: Path):
+    def load(cls, file_id: int, filepath: Path, base_dir: Path):
         # 读取文件状态信息
-        stat = os.stat(filepath)
+        stat = filepath.stat()
         perm = stat.st_mode              # 权限, 2 Bytes
         size = stat.st_size              # 大小, 8 Bytes
-        ctime = stat.st_ctime            # 创建时间, 8 Bytes
         mtime = stat.st_mtime            # 修改时间, 8 Bytes
-        atime = stat.st_atime            # 访问时间, 8 Bytes
         chksum = cls.filehash(filepath)  # 文件 MD5 校验码
         # 计算相对路径
-        relpath = str(filepath.relative_to(dirpath)).encode('utf-8')
-        return cls(file_id, perm, size, ctime, mtime, atime, chksum, relpath)
+        _relpath = filepath.absolute().relative_to(base_dir.absolute())
+        relpath = str(_relpath).encode('utf-8')
+        return cls(file_id, perm, size, mtime, chksum, relpath)
+
+    def set_stat(self, base_dir: Path):
+        '''设置文件属性'''
+        path = self.fullpath(base_dir)
+        # 设置权限
+        path.chmod(self.perm)
+        # 设置时间
+        os.utime(path, (self.mtime, self.mtime))
 
     @staticmethod
     def filehash(filepath: Path) -> bytes:
@@ -47,8 +52,12 @@ class FileInfo(NamedTuple):
                 hasher.update(chunk)
         return hasher.digest()
 
-    def fullpath(self, dirpath: Path):
-        return dirpath.joinpath(self.relpath.decode('utf-8')).absolute()
+    def fullpath(self, base_dir: Path):
+        return base_dir.joinpath(self.relpath.decode('utf-8')).absolute()
+
+    def is_vaild(self, base_dir: Path):
+        '''检查文件校验和'''
+        return self.filehash(self.fullpath(base_dir)) == self.chksum
 
 
 class Reader(Thread):
@@ -123,8 +132,6 @@ class Reader(Thread):
                 print(f'read: FILE_CHUNK  {file_id=}  {seq=}')
                 yield Packet.load(Flag.FILE_CHUNK, file_id, seq, chunk)
                 seq += 1
-            # else:
-            #     yield Packet.load(Flag.FILE_CHUNK, file_id, EOF, b'')
 
     def run(self):
         # 整理所有文件
@@ -256,8 +263,14 @@ class Writer(Thread):
             print(f'write file: {file_id=} {seq=}')
             self.iwriters[file_id].send((seq, chunk))
         except StopIteration:
-            # 文件写入完成
-            self.n_finished += 1
+            # 检查文件 Hash
+            if not self.files[file_id].is_vaild(self.dst_dir):
+                raise ValueError
+            else:
+                # 修改文件属性
+                self.files[file_id].set_stat(self.dst_dir)
+                # 文件写入完成
+                self.n_finished += 1
 
     def run(self):
         # 等待接收文件总数

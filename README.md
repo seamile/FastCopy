@@ -81,9 +81,9 @@
     - 方向: Sender -> Receiver
     - Payload 格式:
 
-        | file_id | perm  | size  | ctime | mtime | atime | chksum | path  |
-        | :-----: | :---: | :---: | :---: | :---: | :---: | :----: | :---: |
-        |   2B    |  2B   |  8B   |  8B   |  8B   |  8B   |  16B   |  ...  |
+        | file_id | perm  | size  | mtime | chksum | path  |
+        | :-----: | :---: | :---: | :---: | :----: | :---: |
+        |   2B    |  2B   |  8B   |  8B   |  16B   |  ...  |
 
 6. 接收端文件准备就绪
 
