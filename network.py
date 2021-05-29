@@ -1,3 +1,4 @@
+import logging
 from binascii import crc32
 from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
@@ -160,10 +161,10 @@ class ConnectionPool:
         pkt = Packet(buf.flag, bytes(buf.data))
         # 检查校验码
         if pkt.is_valid(buf.chksum):
-            print(f'< {pkt.flag.name}: length={pkt.length}')
+            logging.debug(f'< {pkt.flag.name}: length={pkt.length}')
             self.recv_q.put(pkt)  # 正确的数据包放入队列
         else:
-            print('错误的包，丢弃')
+            logging.debug('错误的包，丢弃')
 
         # 一个数据包解析完成后，重置 buf
         buf.reset()
@@ -177,7 +178,7 @@ class ConnectionPool:
                 continue  # 队列为空，直接进入下轮循环
             else:
                 for key, _ in self.sender.select(timeout=0.5):
-                    print(f'> {packet.flag.name}: length={packet.length}')
+                    logging.debug(f'> {packet.flag.name}: length={packet.length}')
                     msg = packet.pack()
                     try:
                         key.fileobj.send(msg)
@@ -248,14 +249,14 @@ class NetworkMixin:
         '''发送数据报文'''
         packet = Packet.load(flag, *args)
         datagram = packet.pack()
-        print(b'> %s' % datagram)
+        logging.debug('> %r' % datagram)
         self.sock.send(datagram)
 
     def recv_msg(self) -> Packet:
         '''接收数据报文'''
         # 接收并解析 head 部分
         head = self.recv_all(LEN_HEAD)
-        print(b'< head: %s' % head)
+        logging.debug('< head: %s' % head)
         flag, chksum, len_body = Packet.unpack_head(head)
 
         if not Flag.contains(flag):
@@ -263,7 +264,7 @@ class NetworkMixin:
 
         # 接收 body 部分
         body = self.recv_all(len_body)
-        print(b'< body: %s' % body)
+        logging.debug('< body: %s' % body)
 
         # 错误重传
         if crc32(body) != chksum:

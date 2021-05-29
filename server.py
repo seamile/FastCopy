@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 
 import socket
-from argparse import ArgumentParser
+import logging
+from argparse import ArgumentParser, BooleanOptionalAction
 from functools import wraps
 from threading import Lock, Thread
 from typing import Dict
@@ -35,13 +36,13 @@ class WatchDog(Thread, NetworkMixin):
     def run(self):
         try:
             # 等待接收新连接的第一个数据报文
-            print('waiting for the first packet from %s:%d' % self.sock.getpeername())
+            logging.debug('waiting for the first packet from %s:%d' % self.sock.getpeername())
             self.sock.settimeout(10)
             packet = self.recv_msg()
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
-            print('waiting timeout')
+            logging.debug('waiting timeout')
             self.sock.close()
             return
 
@@ -56,14 +57,14 @@ class WatchDog(Thread, NetworkMixin):
             self.send_msg(Flag.SID, transfer.sid)
 
         elif packet.flag == Flag.ATTACH:
-            print('run as a follower')
+            logging.debug('run as a follower')
             sid, = packet.unpack_body()
             if not self.server.transfers[sid].conn_pool.add(self.sock):
                 self.sock.close()
 
         else:
             # 对于错误的类型，直接关闭连接
-            print('close conn')
+            logging.debug('close conn')
             self.sock.close()
 
 
@@ -96,27 +97,27 @@ class Server(Thread):
         '''创建新 Transfer'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
-            print(f'Create Sender({sid}, {dst_path})')
+            logging.info(f'New task-{sid}: send {dst_path}')
             self.transfers[sid] = Sender(sid, dst_path, self.max_conn)
         else:
-            print(f'Create Receiver({sid}, {dst_path})')
+            logging.info(f'New task-{sid}: receive {dst_path}')
             self.transfers[sid] = Receiver(sid, dst_path, self.max_conn)
         return self.transfers[sid]
 
     def close_all_transfers(self):
         '''关闭所有 Transfer'''
-        print('closing transfers')
+        logging.debug('closing transfers')
         for transfer in self.transfers.values():
             transfer.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
-        print('Server is running at %s:%d' % self.addr)
+        logging.info('Server is running at %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
-            print('waitting for new connections')
+            logging.debug('waitting for new connections')
             cli_sock, cli_addr = self.srv_sock.accept()
-            print('new connection: %s:%s' % cli_addr)
+            logging.debug('accept new connection: %s:%s' % cli_addr)
 
             # launch a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
@@ -132,7 +133,13 @@ if __name__ == '__main__':
                         help='')
     parser.add_argument('-c', dest='concurrency', type=int, default=256,
                         help='')
+    parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
+                        help='Verbose mode')
+
     args = parser.parse_args()
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(filename='fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
+                        format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
     server = Server(args.bind, args.port, args.concurrency)
     server.start()
     server.join()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 
 import sys
-from argparse import ArgumentParser, RawDescriptionHelpFormatter
+import logging
+from argparse import ArgumentParser, RawDescriptionHelpFormatter, BooleanOptionalAction
 from socket import socket, create_connection
 from textwrap import dedent
 from typing import Optional
@@ -41,7 +42,7 @@ class Client(NetworkMixin):
         if ':' in self.src:
             # 解析远程主机地址
             user, self.host, self.src = self.parse_remote(self.src)
-            print(f'PULL: {user}@{self.host}:{self.port}:{self.src} -> {self.dst}')
+            logging.info(f'PULL: {user}@{self.host}:{self.port}:{self.src} -> {self.dst}')
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PULL, self.src)
@@ -50,7 +51,7 @@ class Client(NetworkMixin):
         elif ':' in self.dst:
             # 解析远程主机地址
             user, self.host, self.dst = self.parse_remote(self.dst)
-            print(f'PUSH: {self.src} -> {user}@{self.host}:{self.port}:{self.dst}')
+            logging.info(f'PUSH: {self.src} -> {user}@{self.host}:{self.port}:{self.dst}')
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PUSH, self.dst)
@@ -90,12 +91,17 @@ if __name__ == '__main__':
     )
     parser.add_argument('-p', dest='port', type=int, default=7325,
                         help='server port (default: 7325)')
-
     parser.add_argument('-n', dest='num', type=int, default=16,
                         help='maximum number of connections (default: 16)')
-
+    parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
+                        help='Verbose mode')
     parser.add_argument(dest='src', help='source path')
     parser.add_argument(dest='dst', help='destination path')
+
     args = parser.parse_args()
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
+                        format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
+
     cli = Client(args.src, args.dst, args.port, args.num)
     cli.launch()
