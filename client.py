@@ -42,7 +42,7 @@ class Client(NetworkMixin):
         if ':' in self.src:
             # 解析远程主机地址
             user, self.host, self.src = self.parse_remote(self.src)
-            logging.info(f'PULL: {user}@{self.host}:{self.port}:{self.src} -> {self.dst}')
+            logging.info(f'PULL: {self.host}:{self.port}:{self.src} -> {self.dst}')
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PULL, self.src)
@@ -51,7 +51,7 @@ class Client(NetworkMixin):
         elif ':' in self.dst:
             # 解析远程主机地址
             user, self.host, self.dst = self.parse_remote(self.dst)
-            logging.info(f'PUSH: {self.src} -> {user}@{self.host}:{self.port}:{self.dst}')
+            logging.info(f'PUSH: {self.src} -> {self.host}:{self.port}:{self.dst}')
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PUSH, self.dst)

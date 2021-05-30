@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import daemon
 import socket
 import logging
 from argparse import ArgumentParser, BooleanOptionalAction
@@ -127,19 +128,29 @@ class Server(Thread):
 if __name__ == '__main__':
     # Server 启动方式: fcpd -h host -p port -c 128
     parser = ArgumentParser()
-    parser.add_argument('-b', dest='bind', type=str, default='0.0.0.0',
-                        help='')
+    parser.add_argument('-b', dest='bind', metavar='IP_ADDRESS', type=str, default='0.0.0.0',
+                        help='the IP address to bind')
     parser.add_argument('-p', dest='port', type=int, default=7325,
-                        help='')
-    parser.add_argument('-c', dest='concurrency', type=int, default=256,
-                        help='')
+                        help='accept connections on this port')
+    parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=256,
+                        help='maximum concurrent connections')
+    parser.add_argument('-d', dest='daemon', type=bool, action=BooleanOptionalAction,
+                        help='daemon mode')
     parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
-                        help='Verbose mode')
+                        help='verbose mode')
 
     args = parser.parse_args()
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(filename='fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
-                        format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
-    server = Server(args.bind, args.port, args.concurrency)
-    server.start()
-    server.join()
+    if args.daemon:
+        with daemon.DaemonContext():
+            logging.basicConfig(filename='/tmp/fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
+                                format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
+            server = Server(args.bind, args.port, args.concurrency)
+            server.start()
+            server.join()
+    else:
+        logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
+                            format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
+        server = Server(args.bind, args.port, args.concurrency)
+        server.start()
+        server.join()
