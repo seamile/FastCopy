@@ -254,7 +254,7 @@ class Writer(Thread):
         except StopIteration:
             # 检查文件 Hash
             if not self.files[file_id].is_vaild(self.dst_dir):
-                raise ValueError
+                raise ValueError('file hash error')
             else:
                 # 修改文件属性
                 self.files[file_id].set_stat(self.dst_dir)
@@ -270,6 +270,7 @@ class Writer(Thread):
         # 取出文件总数，并确认目标路径
         # NOTE: unpack_body 的输出是元组，所以等号前须有逗号
         self.n_files, = packet.unpack_body()
+        logging.info(f'number of files: {self.n_files}')
         self.check_dst_path()
 
         # 等待接收文件信息和数据
