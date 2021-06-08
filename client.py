@@ -9,7 +9,7 @@ from typing import Optional
 
 from const import Flag
 from network import NetworkMixin, Packet
-from transfer import Sender, Receiver, Transfer
+from transport import Sender, Receiver, Transporter
 
 
 class Client(NetworkMixin):
@@ -24,7 +24,7 @@ class Client(NetworkMixin):
 
         # create by self.connect()
         self.sock: Optional[socket] = None  # type: ignore
-        self.transfer: Optional[Transfer] = None
+        self.transporter: Optional[Transporter] = None
 
     def handshake(self, flag: Flag, remote_path: str):
         '''握手'''
@@ -46,7 +46,7 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PULL, self.src)
-            self.transfer = Receiver(self.sid, self.dst, self.n_conn)
+            self.transporter = Receiver(self.sid, self.dst, self.n_conn)
 
         elif ':' in self.dst:
             # 解析远程主机地址
@@ -55,13 +55,13 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PUSH, self.dst)
-            self.transfer = Sender(self.sid, self.src, self.n_conn)
+            self.transporter = Sender(self.sid, self.src, self.n_conn)
 
         else:
             parser.print_help()
             sys.exit(1)
 
-        self.transfer.conn_pool.add(self.sock)
+        self.transporter.conn_pool.add(self.sock)
 
     def create_parallel_connections(self):
         '''创建并行连接'''
@@ -70,13 +70,13 @@ class Client(NetworkMixin):
         for _ in range(self.n_conn - 1):
             sock = create_connection((self.host, self.port))
             sock.send(datagram)
-            self.transfer.conn_pool.add(sock)
+            self.transporter.conn_pool.add(sock)
 
     def launch(self):
         self.init_conn()
         self.create_parallel_connections()
-        self.transfer.start()
-        self.transfer.join()
+        self.transporter.start()
+        self.transporter.join()
 
 
 if __name__ == '__main__':

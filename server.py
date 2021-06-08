@@ -10,7 +10,7 @@ from typing import Dict
 
 from const import Flag
 from network import NetworkMixin
-from transfer import Sender, Receiver, Transfer
+from transport import Sender, Receiver, Transporter
 
 
 def singleton(cls):
@@ -48,19 +48,19 @@ class WatchDog(Thread, NetworkMixin):
             return
 
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
-            # 创建 Transfer
+            # 创建 Transporter
             dst_path, = packet.unpack_body()
-            transfer = self.server.create_transfer(packet.flag, dst_path)
-            transfer.conn_pool.add(self.sock)
-            transfer.start()
+            transporter = self.server.create_transporter(packet.flag, dst_path)
+            transporter.conn_pool.add(self.sock)
+            transporter.start()
 
             # 将 SID 发送给客户端
-            self.send_msg(Flag.SID, transfer.sid)
+            self.send_msg(Flag.SID, transporter.sid)
 
         elif packet.flag == Flag.ATTACH:
             logging.debug('run as a follower')
             sid, = packet.unpack_body()
-            if not self.server.transfers[sid].conn_pool.add(self.sock):
+            if not self.server.transporters[sid].conn_pool.add(self.sock):
                 self.sock.close()
 
         else:
@@ -74,42 +74,42 @@ class Server(Thread):
     def __init__(self, host: str, port: int, max_conn=256) -> None:
         super().__init__(daemon=True)
         self.addr = (host, port)
-        self.max_transfers = 65535  # 最大 Transfer 数量，与 Session ID 相关
-        self.max_conn = max_conn  # 一个 Transfer 的最大连接数
+        self.max_transporters = 65535  # 最大 Transporter 数量，与 Session ID 相关
+        self.max_conn = max_conn  # 一个 Transporter 的最大连接数
         self.is_running = True
         self.mutex = Lock()
         self.next_id = 1
-        self.transfers: Dict[int, Transfer] = {}
+        self.transporters: Dict[int, Transporter] = {}
 
     def geneate_sid(self) -> int:
         with self.mutex:
-            if len(self.transfers) >= self.max_transfers:
-                raise ValueError('已达到最大 Transfer 数量，无法创建')
+            if len(self.transporters) >= self.max_transporters:
+                raise ValueError('已达到最大 Transporter 数量，无法创建')
 
-            while self.next_id in self.transfers:
-                if self.next_id < self.max_transfers:
+            while self.next_id in self.transporters:
+                if self.next_id < self.max_transporters:
                     self.next_id += 1
                 else:
                     self.next_id = 1
             else:
                 return self.next_id
 
-    def create_transfer(self, cli_flag: Flag, dst_path: str) -> Transfer:
-        '''创建新 Transfer'''
+    def create_transporter(self, cli_flag: Flag, dst_path: str) -> Transporter:
+        '''创建新 Transporter'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
             logging.info(f'New task-{sid}: send {dst_path}')
-            self.transfers[sid] = Sender(sid, dst_path, self.max_conn)
+            self.transporters[sid] = Sender(sid, dst_path, self.max_conn)
         else:
             logging.info(f'New task-{sid}: receive {dst_path}')
-            self.transfers[sid] = Receiver(sid, dst_path, self.max_conn)
-        return self.transfers[sid]
+            self.transporters[sid] = Receiver(sid, dst_path, self.max_conn)
+        return self.transporters[sid]
 
-    def close_all_transfers(self):
-        '''关闭所有 Transfer'''
-        logging.debug('closing transfers')
-        for transfer in self.transfers.values():
-            transfer.close()
+    def close_all_transporters(self):
+        '''关闭所有 Transporter'''
+        logging.debug('closing transporters')
+        for transporter in self.transporters.values():
+            transporter.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)

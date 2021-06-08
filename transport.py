@@ -44,4 +44,4 @@ class Receiver(Thread):
         logging.info(f'Receiver({self.sid}) exit')
 
 
-Transfer = Union[Sender, Receiver]
+Transporter = Union[Sender, Receiver]
