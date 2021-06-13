@@ -1,5 +1,6 @@
 import os
 import logging
+from glob import has_magic, iglob
 
 from hashlib import md5
 from math import ceil
@@ -83,6 +84,53 @@ class Reader(Thread):
         self.src_dir: Path = Path('')
         self.n_files = 0
         self.files: Dict[int, Path] = {}
+
+    @staticmethod
+    def abspath(path: str):
+        if path.startswith('/'):
+            return Path(path)
+        elif path.startswith('~'):
+            return Path(os.path.expanduser(path))
+        elif path.startswith('$'):
+            return Path(os.path.expandvars(path))
+        else:
+            return Path.home().joinpath(path)
+
+    @staticmethod
+    def traverse_directory(dir_path: Union[str, Path], include='*', exclude=None):
+        '''遍历文件夹'''
+        if isinstance(dir_path, str):
+            dir_path = Path(dir_path)
+
+        for item in dir_path.rglob(include):
+            if item.is_file() or item.is_dir():
+                if not exclude or not item.match(exclude):
+                    yield item
+            else:
+                logging.debug(f'The `{item}` is not a regular file or dir.')
+
+    @classmethod
+    def search_files_and_dirs(cls, path: str, include='*'):
+        '''查找文件与文件夹'''
+        _path = cls.abspath(path)
+        if has_magic(path):
+            for _item in iglob(str(_path)):
+                item = Path(_item)
+                if item.is_file():
+                    yield item, item.relative_to(item.parent)
+                elif item.is_dir():
+                    for sub_item in cls.traverse_directory(item, include):
+                        yield sub_item, sub_item.relative_to(item.parent)
+                else:
+                    logging.debug(f'The `{item}` is not a regular file or dir.')
+        else:
+            if _path.is_file():
+                yield _path, _path.parent
+            elif _path.is_dir():
+                for item in cls.traverse_directory(_path, include):
+                    yield item, item.relative_to(_path)
+            else:
+                logging.debug(f'The `{path}` is not a regular file or dir.')
 
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
