@@ -13,6 +13,23 @@ from const import CHUNK_SIZE, EOF, Flag
 from network import Packet
 
 
+class DirInfo(NamedTuple):
+    '''文件夹信息'''
+    id: int
+    perm: int
+    relpath: bytes  # 文件的相对路径
+
+    @classmethod
+    def load(cls, dir_id: int, abspath: Path, relpath: Path):
+        return cls(dir_id, abspath.stat().st_mode, bytes(relpath))
+
+    def make(self, parent: Path):
+        _rel = self.relpath.decode('utf8')
+        abspath = parent.joinpath(_rel)
+        abspath.mkdir(parents=True, exist_ok=True)
+        abspath.chmod(self.perm)
+
+
 class FileInfo(NamedTuple):
     '''文件基础信息'''
     fid: int
@@ -27,43 +44,44 @@ class FileInfo(NamedTuple):
         return ceil(self.size / CHUNK_SIZE)
 
     @classmethod
-    def load(cls, file_id: int, file_path: Path, rel_path: Path):
+    def load(cls, file_id: int, fullpath: Path, relpath: Path):
         # 读取文件状态信息
-        stat = file_path.stat()
+        stat = fullpath.stat()
         perm = stat.st_mode    # 权限, 2 Bytes
         size = stat.st_size    # 大小, 8 Bytes
         mtime = stat.st_mtime  # 修改时间, 8 Bytes
-        chksum = cls.filehash(file_path)  # 文件 MD5 校验码
-        return cls(file_id, perm, size, mtime, chksum, bytes(rel_path))
+        chksum = cls.filehash(fullpath)  # 文件 MD5 校验码
+        return cls(file_id, perm, size, mtime, chksum, bytes(relpath))
 
-    def set_stat(self, base_dir: Path):
+    def fullpath(self, parent: Path) -> Path:
+        relpath = self.relpath.decode('utf-8')
+        return parent.joinpath(relpath).absolute()
+
+    def set_stat(self, parent: Path):
         '''设置文件属性'''
-        path = self.fullpath(base_dir)
+        abspath = self.fullpath(parent)
         # 设置权限
-        path.chmod(self.perm)
+        abspath.chmod(self.perm)
         # 设置时间
-        os.utime(path, (self.mtime, self.mtime))
+        os.utime(abspath, (self.mtime, self.mtime))
 
     @staticmethod
-    def filehash(file_path: Path) -> bytes:
+    def filehash(filepath: Path) -> bytes:
         hasher = md5()
-        with open(file_path, 'rb') as fp:
+        with open(filepath, 'rb') as fp:
             while chunk := fp.read(CHUNK_SIZE):
                 hasher.update(chunk)
         return hasher.digest()
 
-    def fullpath(self, base_dir: Path) -> Path:
-        return base_dir.joinpath(self.relpath.decode('utf-8')).absolute()
-
-    def is_vaild(self, base_dir: Path):
+    def is_vaild(self, parent: Path):
         '''检查文件校验和'''
-        return self.filehash(self.fullpath(base_dir)) == self.chksum
+        return self.filehash(self.fullpath(parent)) == self.chksum
 
 
 class Reader(Thread):
     '''文件读取器'''
 
-    def __init__(self, src_path: str, input_q: Queue[Packet], output_q: Queue[Packet]) -> None:
+    def __init__(self, src_paths: Tuple[str], input_q: Queue[Packet], output_q: Queue[Packet]):
         '''
         @src_path: 要读取的目标路径
         @input_q: 输入队列
@@ -71,14 +89,10 @@ class Reader(Thread):
         '''
         super().__init__(daemon=True)
 
-        self.src_path = Path(src_path).absolute()
-        if not self.src_path.exists():
-            raise FileNotFoundError(src_path)
-
+        self.src_paths = src_paths
         self.input_q = input_q
         self.output_q = output_q
 
-        self.src_dir: Path = Path('')
         self.n_files = 0
         self.files: Dict[int, Path] = {}
         self.relpaths: Set[Path] = set()
