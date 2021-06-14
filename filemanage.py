@@ -7,7 +7,7 @@ from math import ceil
 from pathlib import Path
 from queue import Queue
 from threading import Thread
-from typing import Dict, Generator, NamedTuple, Tuple, Union
+from typing import Dict, Generator, NamedTuple, Set, Tuple, Union
 
 from const import CHUNK_SIZE, EOF, Flag
 from network import Packet
@@ -27,17 +27,14 @@ class FileInfo(NamedTuple):
         return ceil(self.size / CHUNK_SIZE)
 
     @classmethod
-    def load(cls, file_id: int, file_path: Path, base_dir: Path):
+    def load(cls, file_id: int, file_path: Path, rel_path: Path):
         # 读取文件状态信息
         stat = file_path.stat()
-        perm = stat.st_mode              # 权限, 2 Bytes
-        size = stat.st_size              # 大小, 8 Bytes
-        mtime = stat.st_mtime            # 修改时间, 8 Bytes
+        perm = stat.st_mode    # 权限, 2 Bytes
+        size = stat.st_size    # 大小, 8 Bytes
+        mtime = stat.st_mtime  # 修改时间, 8 Bytes
         chksum = cls.filehash(file_path)  # 文件 MD5 校验码
-        # 计算相对路径
-        _relpath = file_path.absolute().relative_to(base_dir.absolute())
-        relpath = str(_relpath).encode('utf-8')
-        return cls(file_id, perm, size, mtime, chksum, relpath)
+        return cls(file_id, perm, size, mtime, chksum, bytes(rel_path))
 
     def set_stat(self, base_dir: Path):
         '''设置文件属性'''
@@ -84,6 +81,7 @@ class Reader(Thread):
         self.src_dir: Path = Path('')
         self.n_files = 0
         self.files: Dict[int, Path] = {}
+        self.relpaths: Set[Path] = set()
 
     @staticmethod
     def abspath(path: str):
@@ -110,7 +108,7 @@ class Reader(Thread):
                 logging.debug(f'The `{item}` is not a regular file or dir.')
 
     @classmethod
-    def search_files_and_dirs(cls, path: str, include='*'):
+    def search_files_and_dirs(cls, path: str, include='*') -> Generator[Tuple[Path, Path], None, None]:
         '''查找文件与文件夹'''
         _path = cls.abspath(path)
         if has_magic(path):
@@ -134,32 +132,19 @@ class Reader(Thread):
 
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
-        file_id = 0  # 文件初始 ID 为 0
+        items = self.search_files_and_dirs(self.src_path)
+        for file_id, (abspath, relpath) in enumerate(items):
+            if abspath.is_file():
+                if relpath not in self.relpaths:
+                    logging.debug(f'find file: {file_id=} file_path={abspath.as_posix()}')
+                    self.relpaths.add(relpath)
+                    self.files[file_id] = abspath
+                else:
+                    logging.debug(f'find file: {file_id=} file_path={abspath.as_posix()}')
+            else:
+                pass  # TODO
 
-        if self.src_path.is_dir():
-            # 目标路径是文件夹，遍历整个目录，将所有文件整理出来
-            self.src_dir = self.src_path
-            for dir_name, _, file_names in os.walk(self.src_path):
-                directory = Path(dir_name)
-                for file_name in file_names:
-                    file_path = directory.joinpath(file_name)
-                    if file_path.is_file() or file_path.is_dir():
-                        logging.debug(f'find file: {file_id=} {file_path=}')
-                        self.files[file_id] = file_path  # 记录文件路径
-                        file_id += 1  # File ID 自增
-
-            # 记录文件总数
-            self.n_files = file_id
-
-        elif self.src_path.is_file():
-            # 目标路径是单文件，直接加入文件列表
-            self.src_dir = self.src_path.parent
-            self.files[file_id] = self.src_path
-            self.n_files = 1
-            logging.debug(f'find file: {file_id=} file_path={self.src_path}')
-
-        else:
-            raise TypeError(f'The dest file `{self.src_path}` is not a regular file.')
+        self.n_files = file_id + 1  # TODO: 排除文件夹
 
     def iread(self, file_id: int) -> Generator[Packet, None, None]:
         '''封装文件数据块报文'''
