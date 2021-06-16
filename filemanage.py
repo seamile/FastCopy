@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from glob import has_magic, iglob
 
@@ -7,7 +8,7 @@ from math import ceil
 from pathlib import Path
 from queue import Queue
 from threading import Thread
-from typing import Dict, Generator, NamedTuple, Set, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, NamedTuple, Set, Tuple, Union
 
 from const import CHUNK_SIZE, EOF, Flag
 from network import Packet
@@ -20,24 +21,37 @@ class DirInfo(NamedTuple):
     relpath: bytes  # 文件的相对路径
 
     @classmethod
-    def load(cls, dir_id: int, abspath: Path, relpath: Path):
-        return cls(dir_id, abspath.stat().st_mode, bytes(relpath))
+    def load(cls, dir_id: int, fullpath: Path, relpath: Path):
+        return cls(dir_id, fullpath.stat().st_mode, bytes(relpath))
 
     def make(self, parent: Path):
         _rel = self.relpath.decode('utf8')
-        abspath = parent.joinpath(_rel)
-        abspath.mkdir(parents=True, exist_ok=True)
-        abspath.chmod(self.perm)
+        fullpath = parent.joinpath(_rel)
+        fullpath.mkdir(parents=True, exist_ok=True)
+        fullpath.chmod(self.perm)
 
 
-class FileInfo(NamedTuple):
+class FileInfo:
     '''文件基础信息'''
-    fid: int
-    perm: int
-    size: int
-    mtime: float
-    chksum: bytes
-    relpath: bytes  # 文件的相对路径
+
+    __slots__ = ('id', 'perm', 'size', 'mtime', 'chksum', 'relpath', 'abspath', '_values')
+
+    def __init__(self, id: int, perm: int, size: int, mtime: float, chksum: bytes, relpath: bytes):
+        self.id = id
+        self.perm = perm
+        self.size = size
+        self.mtime = mtime
+        self.chksum = chksum
+        self.relpath = relpath  # 文件的相对路径
+        self.abspath = Path()  # 文件的绝对路径
+
+    def __getitem__(self, index):
+        if not hasattr(self, '_values'):
+            self._values = [self.id, self.perm, self.size, self.mtime, self.chksum, self.relpath]
+        return self._values[index]
+
+    def __str__(self) -> str:
+        return f'FileInfo(id={self.id}, perm={self.perm}, sz={self.size}, chk={self.chksum.hex()})'
 
     @property
     def n_chunks(self):
@@ -50,32 +64,58 @@ class FileInfo(NamedTuple):
         perm = stat.st_mode    # 权限, 2 Bytes
         size = stat.st_size    # 大小, 8 Bytes
         mtime = stat.st_mtime  # 修改时间, 8 Bytes
-        chksum = cls.filehash(fullpath)  # 文件 MD5 校验码
+        chksum = cls.hash(fullpath)  # 文件 MD5 校验码
         return cls(file_id, perm, size, mtime, chksum, bytes(relpath))
 
-    def fullpath(self, parent: Path) -> Path:
-        relpath = self.relpath.decode('utf-8')
-        return parent.joinpath(relpath).absolute()
+    def set_abspath(self, parent: Path):
+        self.abspath = parent.joinpath(self.relpath.decode('utf8'))
 
-    def set_stat(self, parent: Path):
+    def set_stat(self):
         '''设置文件属性'''
-        abspath = self.fullpath(parent)
         # 设置权限
-        abspath.chmod(self.perm)
+        self.abspath.chmod(self.perm)
         # 设置时间
-        os.utime(abspath, (self.mtime, self.mtime))
+        os.utime(self.abspath, (self.mtime, self.mtime))
+
+    def touch(self):
+        '''创建空文件'''
+        if self.abspath.is_file():
+            st = self.abspath.stat()
+            if st.st_size > self.size:
+                logging.debug(f'truncate file {self.abspath}')
+                with open(self.abspath, 'rb+') as fp:
+                    fp.truncate(self.size)
+            else:
+                logging.debug(f'file {self.abspath} exists')
+        else:
+            # 文件不存在时，创建空文件
+            logging.debug(f'make file {self.abspath}')
+            open(self.abspath, 'w').close()
+
+    def iwrite(self) -> Generator[None, Tuple[int, bytes], None]:
+        '''按数据块迭代写入'''
+        seqs = {i for i in range(self.n_chunks)}
+        with open(self.abspath, 'rb+') as fp:
+            while seqs:
+                seq, chunk = yield
+                if seq in seqs:
+                    fp.seek(seq * CHUNK_SIZE)
+                    fp.write(chunk)
+                    seqs.remove(seq)
+                else:
+                    raise ValueError
 
     @staticmethod
-    def filehash(filepath: Path) -> bytes:
+    def hash(filepath: Path) -> bytes:
         hasher = md5()
         with open(filepath, 'rb') as fp:
             while chunk := fp.read(CHUNK_SIZE):
                 hasher.update(chunk)
         return hasher.digest()
 
-    def is_vaild(self, parent: Path):
+    def is_vaild(self):
         '''检查文件校验和'''
-        return self.filehash(self.fullpath(parent)) == self.chksum
+        return self.hash(self.abspath) == self.chksum
 
 
 class Reader(Thread):
@@ -94,7 +134,7 @@ class Reader(Thread):
         self.output_q = output_q
 
         self.n_files = 0
-        self.files: Dict[int, Path] = {}
+        self.files: Dict[int, Any] = {}
         self.relpaths: Set[Path] = set()
 
     @staticmethod
@@ -109,60 +149,79 @@ class Reader(Thread):
             return Path.home().joinpath(path)
 
     @staticmethod
-    def traverse_directory(dir_path: Union[str, Path], include='*', exclude=None):
+    def traverse_directory(dir_path: Union[str, Path], include):
         '''遍历文件夹'''
         if isinstance(dir_path, str):
             dir_path = Path(dir_path)
 
         for item in dir_path.rglob(include):
             if item.is_file() or item.is_dir():
-                if not exclude or not item.match(exclude):
-                    yield item
+                yield item
             else:
                 logging.debug(f'The `{item}` is not a regular file or dir.')
 
+    @staticmethod
+    def need_exclude(path: Path, patterns: Iterable[str]) -> bool:
+        if patterns:
+            for pattern in patterns:
+                try:
+                    if path.match(pattern) or bool(re.search(pattern, path.as_posix())):
+                        return True
+                except re.error:
+                    continue
+        return False
+
     @classmethod
-    def search_files_and_dirs(cls, path: str, include='*') -> Generator[Tuple[Path, Path], None, None]:
+    def checkout_paths(cls, fullpath: Path, include: str, excludes: Iterable[str]) \
+            -> Generator[Tuple[Path, Path], None, None]:
+        '''检出路径'''
+        if fullpath.is_file():
+            relpath = fullpath.relative_to(fullpath.parent)
+            if not cls.need_exclude(relpath, excludes):
+                yield fullpath, relpath
+        elif fullpath.is_dir():
+            for sub_path in cls.traverse_directory(fullpath, include):
+                relpath = sub_path.relative_to(fullpath)
+                if not cls.need_exclude(relpath, excludes):
+                    yield sub_path, relpath
+        else:
+            logging.debug(f'The `{fullpath}` is not a regular file or dir.')
+
+    @classmethod
+    def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
+            -> Generator[Tuple[Path, Path], None, None]:
         '''查找文件与文件夹'''
         _path = cls.abspath(path)
         if has_magic(path):
-            for _item in iglob(str(_path)):
-                item = Path(_item)
-                if item.is_file():
-                    yield item, item.relative_to(item.parent)
-                elif item.is_dir():
-                    for sub_item in cls.traverse_directory(item, include):
-                        yield sub_item, sub_item.relative_to(item.parent)
-                else:
-                    logging.debug(f'The `{item}` is not a regular file or dir.')
+            for matched_path in iglob(str(_path)):
+                for paths in cls.checkout_paths(Path(matched_path), include, excludes):
+                    yield paths
         else:
-            if _path.is_file():
-                yield _path, _path.parent
-            elif _path.is_dir():
-                for item in cls.traverse_directory(_path, include):
-                    yield item, item.relative_to(_path)
-            else:
-                logging.debug(f'The `{path}` is not a regular file or dir.')
+            for paths in cls.checkout_paths(_path, include, excludes):
+                yield paths
 
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
+        _id = 0
         items = self.search_files_and_dirs(self.src_path)
-        for file_id, (abspath, relpath) in enumerate(items):
-            if abspath.is_file():
-                if relpath not in self.relpaths:
-                    logging.debug(f'find file: {file_id=} file_path={abspath.as_posix()}')
-                    self.relpaths.add(relpath)
-                    self.files[file_id] = abspath
+        for fullpath, relpath in items:
+            if relpath not in self.relpaths:
+                self.relpaths.add(relpath)
+                if fullpath.is_file():
+                    logging.debug(f'find file: id={_id} path={fullpath.as_posix()}')
+                    self.files[_id] = (fullpath, FileInfo.load(_id, fullpath, relpath))
                 else:
-                    logging.debug(f'find file: {file_id=} file_path={abspath.as_posix()}')
-            else:
-                pass  # TODO
+                    logging.debug(f'find dir : id={_id} path={fullpath.as_posix()}')
+                    self.files[_id] = (fullpath, DirInfo.load(_id, fullpath, relpath))
 
-        self.n_files = file_id + 1  # TODO: 排除文件夹
+                _id += 1
 
+        self.n_files = _id
+
+    @staticmethod
     def iread(self, file_id: int) -> Generator[Packet, None, None]:
         '''封装文件数据块报文'''
-        with open(self.files[file_id], 'rb') as fp:
+        with open(self.files[file_id][0], 'rb') as fp:
             seq = 0
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
                 logging.debug(f'got chunk {file_id=} {seq=}')
@@ -224,36 +283,6 @@ class Writer(Thread):
         self.iwriters: Dict[int, Generator] = {}
         self.use_custom_dst_path = False
 
-    @staticmethod
-    def make_empty_file(file_path: Union[str, Path], file_size: int):
-        logging.debug(f'make empty file: {file_path}')
-        block_size = 1024 * 1024  # 一次写入的块大小，默认为 1Mb
-        count, remain = divmod(file_size, block_size)
-        chunk = b'\x00' * block_size
-        ending = b'\x00' * remain
-
-        # 创建文件所在目录
-        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-        # 创建空文件
-        with open(file_path, 'wb') as dst_fp:
-            for _ in range(count):
-                dst_fp.write(chunk)
-            else:
-                dst_fp.write(ending)
-
-    @staticmethod
-    def iwrite(file_path: Union[str, Path], n_chunks: int) -> Generator[None, Tuple[int, bytes], None]:
-        seqs = {i for i in range(n_chunks)}
-        with open(file_path, 'rb+') as fp:
-            while seqs:
-                seq, chunk = yield
-                if seq in seqs:
-                    fp.seek(seq * CHUNK_SIZE)
-                    fp.write(chunk)
-                    seqs.remove(seq)
-                else:
-                    raise ValueError
-
     def check_dst_path(self):
         '''检查目标路径'''
         if self.n_files <= 0:
@@ -277,19 +306,19 @@ class Writer(Thread):
         '''处理文件信息报文'''
         # 解包，并创建 FileInfo 对象
         f_info = FileInfo(*packet.unpack_body())
-        self.files[f_info.fid] = f_info
+        self.files[f_info.id] = f_info
 
         # 创建空文件
-        full_path = f_info.fullpath(self.dst_dir)
-        self.make_empty_file(full_path, f_info.size)
+        f_info.set_abspath(self.dst_dir)
+        f_info.touch()
 
         # 创建并启动写入迭代器
-        self.iwriters[f_info.fid] = self.iwrite(full_path, f_info.n_chunks)
-        self.iwriters[f_info.fid].send(None)
+        self.iwriters[f_info.id] = f_info.iwrite()  # self.iwrite(full_path, f_info.n_chunks)
+        self.iwriters[f_info.id].send(None)
 
         # 创建文件准备就绪报文
-        logging.debug(f'File ready: id={f_info.fid} path={f_info.relpath}')  # type: ignore
-        ready_pkt = Packet.load(Flag.FILE_READY, f_info.fid)
+        logging.debug(f'File ready: id={f_info.id} path={f_info.relpath}')  # type: ignore
+        ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
         self.output_q.put(ready_pkt)
 
     def handle_file_chunk(self, packet: Packet):
@@ -300,11 +329,11 @@ class Writer(Thread):
             self.iwriters[file_id].send((seq, chunk))
         except StopIteration:
             # 检查文件 Hash
-            if not self.files[file_id].is_vaild(self.dst_dir):
+            if not self.files[file_id].is_vaild():
                 raise ValueError('file hash error')
             else:
                 # 修改文件属性
-                self.files[file_id].set_stat(self.dst_dir)
+                self.files[file_id].set_stat()
                 # 文件写入完成
                 self.n_finished += 1
 
