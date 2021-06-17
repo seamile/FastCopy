@@ -107,14 +107,14 @@ class FileInfo:
         if self.abspath.is_file():
             st = self.abspath.stat()
             if st.st_size > self.size:
-                logging.debug(f'truncate file {self.abspath}')
+                logging.debug(f'[FileInfo] truncate file {self.abspath}')
                 with open(self.abspath, 'rb+') as fp:
                     fp.truncate(self.size)
             else:
-                logging.debug(f'file {self.abspath} exists')
+                logging.debug(f'[FileInfo] file {self.abspath} exists')
         else:
             # 文件不存在时，创建空文件
-            logging.debug(f'make file {self.abspath}')
+            logging.debug(f'[FileInfo] make file {self.abspath}')
             open(self.abspath, 'w').close()
 
     def iread(self) -> Generator[Packet, None, None]:
@@ -122,7 +122,6 @@ class FileInfo:
         with open(self.abspath, 'rb') as fp:
             seq = 0
             while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
-                logging.debug(f'got chunk file({self.id}) {seq=}')
                 yield Packet.load(Flag.FILE_CHUNK, self.id, seq, chunk)
                 seq += 1
 
@@ -191,7 +190,7 @@ class Reader(Thread):
             if item.is_file() or item.is_dir():
                 yield item
             else:
-                logging.debug(f'The `{item}` is not a regular file or dir.')
+                logging.debug(f'[Reader] The `{item}` is not a regular file or dir.')
 
     @staticmethod
     def need_exclude(path: Path, patterns: Iterable[str]) -> bool:
@@ -218,7 +217,7 @@ class Reader(Thread):
                 if not cls.need_exclude(relpath, excludes):
                     yield sub_path, relpath
         else:
-            logging.debug(f'The `{fullpath}` is not a regular file or dir.')
+            logging.debug(f'[Reader] The `{fullpath}` is not a regular file or dir.')
 
     @classmethod
     def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
@@ -254,7 +253,7 @@ class Reader(Thread):
     def run(self):
         # 整理所有文件
         self.prepare_all_files()
-        logging.info(f'Num of files and dirs: {self.total}')
+        logging.info(f'[Reader] Num of files and dirs: {self.total}')
 
         # 将文件数量写入队列
         packet = Packet.load(Flag.FILE_COUNT, self.total)
@@ -268,7 +267,7 @@ class Reader(Thread):
             self.output_q.put(packet)
 
         # 将对端准备就绪的文件读入 output_q
-        n_files_sent = 0
+        n_items_sent = 0
         while True:
             try:
                 packet = self.input_q.get(timeout=TIMEOUT)
@@ -280,7 +279,7 @@ class Reader(Thread):
                     f_id, = packet.unpack_body()
                     for chunk_packet in self.tree[f_id].iread():
                         self.output_q.put(chunk_packet)
-                    n_files_sent += 1
+                    n_items_sent += 1
                 elif packet.flag == Flag.DONE:
                     logging.info('[Reader] All files are processed, reader exit.')
                     break
@@ -303,26 +302,26 @@ class Writer(Thread):
         self.input_q = input_q
         self.output_q = output_q
 
-        self.dst_dir = Path('')
-        self.n_files = 0
-        self.n_finished = 0
+        self.dst_dir = Path()
+        self.total = 0
+        self.n_items_recv = 0
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
-        self.use_custom_dst_path = False
+        self.use_custom_name = False
 
     def check_dst_path(self):
         '''检查目标路径'''
-        if self.n_files <= 0:
+        if self.total <= 0:
             raise ValueError
 
-        elif self.n_files == 1:
+        elif self.total == 1:
             # 单文件传输
             if self.dst_path.is_dir():
                 self.dst_dir = self.dst_path
             else:
                 self.dst_dir = self.dst_path.parent
                 self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
-                self.use_custom_dst_path = True
+                self.use_custom_name = True
 
         else:
             # 多文件传输
@@ -344,7 +343,7 @@ class Writer(Thread):
         self.iwriters[f_info.id].send(None)
 
         # 创建文件准备就绪报文
-        logging.debug(f'File ready: id={f_info.id} path={f_info.relpath}')  # type: ignore
+        logging.debug(f'[Writer] File ready: id={f_info.id} path={f_info.relpath}')  # type: ignore
         ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
         self.output_q.put(ready_pkt)
 
@@ -352,32 +351,32 @@ class Writer(Thread):
         '''处理文件数据块'''
         file_id, seq, chunk = packet.unpack_body()
         try:
-            logging.debug(f'write file: {file_id=} {seq=}')
+            logging.debug(f'[Writer] write file: {file_id=} {seq=}')
             self.iwriters[file_id].send((seq, chunk))
         except StopIteration:
             # 检查文件 Hash
             if not self.files[file_id].is_vaild():
-                raise ValueError('file hash error')
+                raise ValueError('[Writer] file hash error')
             else:
                 # 修改文件属性
                 self.files[file_id].set_stat()
                 # 文件写入完成
-                self.n_finished += 1
+                self.n_items_recv += 1
 
     def run(self):
-        # 等待接收文件总数
+        # 等待接收文件总数数据包
         packet = self.input_q.get()
-        if packet.flag != Flag.FILE_COUNT:
-            raise ValueError
-
-        # 取出文件总数，并确认目标路径
-        # NOTE: unpack_body 的输出是元组，所以等号前须有逗号
-        self.n_files, = packet.unpack_body()
-        logging.info(f'number of files: {self.n_files}')
-        self.check_dst_path()
+        if packet.flag == Flag.FILE_COUNT:
+            # 取出文件总数，并确认目标路径
+            self.total, = packet.unpack_body()  # NOTE: unpack_body() 的结果是元组，所以等号前须有逗号
+            logging.info(f'[Writer] Num of files and dirs: {self.total}')
+            self.check_dst_path()
+        else:
+            logging.error('[Writer] the first packet must be `FILE_COUNT`')
+            return
 
         # 等待接收文件信息和数据
-        while self.n_finished < self.n_files:
+        while self.n_items_recv < self.total:
             packet = self.input_q.get()
             if packet.flag == Flag.FILE_INFO:
                 self.handle_file_info(packet)
@@ -386,7 +385,7 @@ class Writer(Thread):
                 self.handle_file_chunk(packet)
 
             else:
-                raise ValueError(f'Unknow packet flag: {packet.flag}')
+                raise ValueError(f'[Writer] Unknow packet flag: {packet.flag}')
         else:
             self.output_q.put(Packet.load(Flag.DONE, EOF))
-            logging.info('Writer: all file finished')
+            logging.info('[Writer] all file finished')
