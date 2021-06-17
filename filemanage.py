@@ -166,7 +166,6 @@ class Reader(Thread):
         self.input_q = input_q
         self.output_q = output_q
 
-        self.total = 0
         self.tree: Dict[int, Union[DirInfo, FileInfo]] = {}
 
     @staticmethod
@@ -248,26 +247,25 @@ class Reader(Thread):
                 else:
                     logging.debug(f'[Reader] Name conflict: `{relpath.as_posix()}`, ignore `{fullpath.as_posix()}`')
 
-        self.total = _id
+        return _id  # _id == n_files + n_dirs
 
     def run(self):
         # 整理所有文件
-        self.prepare_all_files()
-        logging.info(f'[Reader] Num of files and dirs: {self.total}')
+        total = self.prepare_all_files()
+        logging.info(f'[Reader] Num of files and dirs: {total}')
 
         # 将文件数量写入队列
-        packet = Packet.load(Flag.FILE_COUNT, self.total)
+        packet = Packet.load(Flag.FILE_COUNT, total)
         self.output_q.put(packet)
 
         # 将目录树信息写入队列
-        for _id in range(self.total):
+        for _id in range(total):
             _info = self.tree[_id]
             flag = Flag.DIR_INFO if _info.abspath.is_dir() else Flag.FILE_INFO
             packet = Packet.load(flag, *_info)
             self.output_q.put(packet)
 
         # 将对端准备就绪的文件读入 output_q
-        n_items_sent = 0
         while True:
             try:
                 packet = self.input_q.get(timeout=TIMEOUT)
@@ -279,7 +277,6 @@ class Reader(Thread):
                     f_id, = packet.unpack_body()
                     for chunk_packet in self.tree[f_id].iread():
                         self.output_q.put(chunk_packet)
-                    n_items_sent += 1
                 elif packet.flag == Flag.DONE:
                     logging.info('[Reader] All files are processed, reader exit.')
                     break
@@ -303,8 +300,9 @@ class Writer(Thread):
         self.output_q = output_q
 
         self.dst_dir = Path()
+        self.size = 0
         self.total = 0
-        self.n_items_recv = 0
+        self.n_recv = 0
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
         self.use_custom_name = False
@@ -328,40 +326,58 @@ class Writer(Thread):
             self.dst_dir = self.dst_path
             self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
 
-    def handle_file_info(self, packet: Packet):
+    def process_dir_info(self, packet: Packet):
+        '''处理目录信息报文'''
+        # 创建目录
+        d_info = DirInfo(*packet.unpack_body())
+        d_info.set_abspath(self.dst_dir)
+        d_info.make()
+        # 接收数量 +1
+        self.n_recv += 1
+
+    def process_file_info(self, packet: Packet):
         '''处理文件信息报文'''
         # 解包，并创建 FileInfo 对象
         f_info = FileInfo(*packet.unpack_body())
-        self.files[f_info.id] = f_info
-
-        # 创建空文件
         f_info.set_abspath(self.dst_dir)
-        f_info.touch()
 
-        # 创建并启动写入迭代器
-        self.iwriters[f_info.id] = f_info.iwrite()  # self.iwrite(full_path, f_info.n_chunks)
-        self.iwriters[f_info.id].send(None)
+        # 检查文件是否需要传输
+        if f_info.abspath.is_file() and f_info.is_vaild():
+            f_info.set_stat()
+            self.n_recv += 1
+            logging.debug(f'[Writer] File finished: {f_info.abspath}')
+        else:
+            # 创建空文件
+            f_info.touch()
+            self.files[f_info.id] = f_info
+            self.size += f_info.size
 
-        # 创建文件准备就绪报文
-        logging.debug(f'[Writer] File ready: id={f_info.id} path={f_info.relpath}')  # type: ignore
-        ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
-        self.output_q.put(ready_pkt)
+            # 创建并启动写入迭代器
+            self.iwriters[f_info.id] = f_info.iwrite()
+            self.iwriters[f_info.id].send(None)
 
-    def handle_file_chunk(self, packet: Packet):
+            # 通知对端：文件准备就绪
+            logging.debug(f'[Writer] File ready: {f_info}')
+            ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
+            self.output_q.put(ready_pkt)
+
+    def process_file_chunk(self, packet: Packet):
         '''处理文件数据块'''
-        file_id, seq, chunk = packet.unpack_body()
+        f_id, seq, chunk = packet.unpack_body()
         try:
-            logging.debug(f'[Writer] write file: {file_id=} {seq=}')
-            self.iwriters[file_id].send((seq, chunk))
+            logging.debug(f'[Writer] Write file: {f_id=} {seq=}')
+            self.iwriters[f_id].send((seq, chunk))
         except StopIteration:
             # 检查文件 Hash
-            if not self.files[file_id].is_vaild():
-                raise ValueError('[Writer] file hash error')
+            if not self.files[f_id].is_vaild():
+                # TODO: 错误重传机制
+                logging.error(f'[Writer] File hash error: {self.files[f_id].abspath}')
             else:
                 # 修改文件属性
-                self.files[file_id].set_stat()
-                # 文件写入完成
-                self.n_items_recv += 1
+                self.files[f_id].set_stat()
+                self.n_recv += 1
+                logging.debug(f'[Writer] File finished: {self.files[f_id].abspath}')
+        return len(chunk)
 
     def run(self):
         # 等待接收文件总数数据包
@@ -372,20 +388,25 @@ class Writer(Thread):
             logging.info(f'[Writer] Num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
-            logging.error('[Writer] the first packet must be `FILE_COUNT`')
+            logging.error('[Writer] The first packet must be `FILE_COUNT`')
             return
 
         # 等待接收文件信息和数据
-        while self.n_items_recv < self.total:
+        recv_size = 0
+        while self.n_recv < self.total:
             packet = self.input_q.get()
-            if packet.flag == Flag.FILE_INFO:
-                self.handle_file_info(packet)
+            if packet.flag == Flag.DIR_INFO:
+                self.process_dir_info(packet)
+
+            elif packet.flag == Flag.FILE_INFO:
+                self.process_file_info(packet)
 
             elif packet.flag == Flag.FILE_CHUNK:
-                self.handle_file_chunk(packet)
+                recv_size += self.process_file_chunk(packet)
+                logging.info(f'[Writer] Progress: {recv_size / self.size: 7.2%}')
 
             else:
-                raise ValueError(f'[Writer] Unknow packet flag: {packet.flag}')
+                logging.error(f'[Writer] Unknow packet flag: {packet.flag}')
         else:
             self.output_q.put(Packet.load(Flag.DONE, EOF))
-            logging.info('[Writer] all file finished')
+            logging.info('[Writer] All files finished')
