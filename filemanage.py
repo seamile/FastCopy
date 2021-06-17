@@ -6,34 +6,54 @@ from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Thread
-from typing import Any, Dict, Generator, Iterable, NamedTuple, Set, Tuple, Union
+from typing import Dict, Generator, Iterable, Tuple, Union
 
-from const import CHUNK_SIZE, EOF, Flag
+from const import CHUNK_SIZE, EOF, Flag, TIMEOUT
 from network import Packet
 
 
-class DirInfo(NamedTuple):
+class DirInfo:
     '''文件夹信息'''
-    id: int
-    perm: int
-    relpath: bytes  # 文件的相对路径
+    __slots__ = ('id', 'perm', 'relpath', 'abspath', '_values')
+
+    def __init__(self, id: int, perm: int, relpath: bytes) -> None:
+        self.id = id
+        self.perm = perm
+        self.relpath = relpath
+        self.abspath = Path()
+
+    def __getitem__(self, index):
+        if not hasattr(self, '_values'):
+            self._values = [self.id, self.perm, self.relpath]
+        return self._values[index]
+
+    def __str__(self) -> str:
+        return f'FileInfo(id={self.id}, perm={self.perm})'
 
     @classmethod
     def load(cls, dir_id: int, fullpath: Path, relpath: Path):
-        return cls(dir_id, fullpath.stat().st_mode, bytes(relpath))
+        d_info = cls(dir_id, fullpath.stat().st_mode, bytes(relpath))
+        d_info.set_abspath(fullpath)
+        return d_info
 
-    def make(self, parent: Path):
-        _rel = self.relpath.decode('utf8')
-        fullpath = parent.joinpath(_rel)
-        fullpath.mkdir(parents=True, exist_ok=True)
-        fullpath.chmod(self.perm)
+    def set_abspath(self, parent: Path):
+        '''设置绝对路径'''
+        self.abspath = parent.joinpath(self.relpath.decode('utf8'))
+        return self.abspath
+
+    def set_stat(self):
+        '''设置目录属性'''
+        self.abspath.chmod(self.perm)
+
+    def make(self):
+        self.abspath.mkdir(parents=True, exist_ok=True)
+        self.abspath.chmod(self.perm)
 
 
 class FileInfo:
     '''文件基础信息'''
-
     __slots__ = ('id', 'perm', 'size', 'mtime', 'chksum', 'relpath', 'abspath', '_values')
 
     def __init__(self, id: int, perm: int, size: int, mtime: float, chksum: bytes, relpath: bytes):
@@ -42,8 +62,8 @@ class FileInfo:
         self.size = size
         self.mtime = mtime
         self.chksum = chksum
-        self.relpath = relpath  # 文件的相对路径
-        self.abspath = Path()  # 文件的绝对路径
+        self.relpath = relpath
+        self.abspath = Path()
 
     def __getitem__(self, index):
         if not hasattr(self, '_values'):
@@ -61,14 +81,19 @@ class FileInfo:
     def load(cls, file_id: int, fullpath: Path, relpath: Path):
         # 读取文件状态信息
         stat = fullpath.stat()
-        perm = stat.st_mode    # 权限, 2 Bytes
-        size = stat.st_size    # 大小, 8 Bytes
-        mtime = stat.st_mtime  # 修改时间, 8 Bytes
-        chksum = cls.hash(fullpath)  # 文件 MD5 校验码
-        return cls(file_id, perm, size, mtime, chksum, bytes(relpath))
+        f_info = cls(file_id,
+                     stat.st_mode,   # 权限, 2 Bytes
+                     stat.st_size,   # 大小, 8 Bytes
+                     stat.st_mtime,  # 修改时间, 8 Bytes
+                     cls.hash(fullpath),  # 文件 MD5 校验码
+                     bytes(relpath))
+        f_info.set_abspath(fullpath)
+        return f_info
 
     def set_abspath(self, parent: Path):
+        '''设置绝对路径'''
         self.abspath = parent.joinpath(self.relpath.decode('utf8'))
+        return self.abspath
 
     def set_stat(self):
         '''设置文件属性'''
@@ -91,6 +116,15 @@ class FileInfo:
             # 文件不存在时，创建空文件
             logging.debug(f'make file {self.abspath}')
             open(self.abspath, 'w').close()
+
+    def iread(self) -> Generator[Packet, None, None]:
+        '''封装文件数据块报文'''
+        with open(self.abspath, 'rb') as fp:
+            seq = 0
+            while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
+                logging.debug(f'got chunk file({self.id}) {seq=}')
+                yield Packet.load(Flag.FILE_CHUNK, self.id, seq, chunk)
+                seq += 1
 
     def iwrite(self) -> Generator[None, Tuple[int, bytes], None]:
         '''按数据块迭代写入'''
@@ -133,9 +167,8 @@ class Reader(Thread):
         self.input_q = input_q
         self.output_q = output_q
 
-        self.n_files = 0
-        self.files: Dict[int, Any] = {}
-        self.relpaths: Set[Path] = set()
+        self.total = 0
+        self.tree: Dict[int, Union[DirInfo, FileInfo]] = {}
 
     @staticmethod
     def abspath(path: str):
@@ -203,62 +236,56 @@ class Reader(Thread):
     def prepare_all_files(self):
         '''整理要传输的文件列表'''
         _id = 0
-        items = self.search_files_and_dirs(self.src_path)
-        for fullpath, relpath in items:
-            if relpath not in self.relpaths:
-                self.relpaths.add(relpath)
-                if fullpath.is_file():
-                    logging.debug(f'find file: id={_id} path={fullpath.as_posix()}')
-                    self.files[_id] = (fullpath, FileInfo.load(_id, fullpath, relpath))
+        relpaths = set()
+        for src_path in self.src_paths:
+            items = self.search_files_and_dirs(src_path)
+            for fullpath, relpath in items:
+                if relpath not in relpaths:
+                    relpaths.add(relpath)
+                    inf_cls = FileInfo if fullpath.is_file() else DirInfo
+                    self.tree[_id] = inf_cls.load(_id, fullpath, relpath)
+                    logging.debug(f'[Reader] Found {inf_cls.__name__}: id={_id} path={fullpath.as_posix()}')
+                    _id += 1
                 else:
-                    logging.debug(f'find dir : id={_id} path={fullpath.as_posix()}')
-                    self.files[_id] = (fullpath, DirInfo.load(_id, fullpath, relpath))
+                    logging.debug(f'[Reader] Name conflict: `{relpath.as_posix()}`, ignore `{fullpath.as_posix()}`')
 
-                _id += 1
-
-        self.n_files = _id
-
-    @staticmethod
-    def iread(self, file_id: int) -> Generator[Packet, None, None]:
-        '''封装文件数据块报文'''
-        with open(self.files[file_id][0], 'rb') as fp:
-            seq = 0
-            while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
-                logging.debug(f'got chunk {file_id=} {seq=}')
-                yield Packet.load(Flag.FILE_CHUNK, file_id, seq, chunk)
-                seq += 1
+        self.total = _id
 
     def run(self):
         # 整理所有文件
         self.prepare_all_files()
-        logging.debug(f'num of files: {self.n_files}')
+        logging.info(f'Num of files and dirs: {self.total}')
 
         # 将文件数量写入队列
-        packet = Packet.load(Flag.FILE_COUNT, self.n_files)
+        packet = Packet.load(Flag.FILE_COUNT, self.total)
         self.output_q.put(packet)
 
-        # 将文件信息写入队列
-        for f_id in range(self.n_files):
-            file_info = FileInfo.load(f_id, self.files[f_id], self.src_dir)
-            packet = Packet.load(Flag.FILE_INFO, *file_info)
+        # 将目录树信息写入队列
+        for _id in range(self.total):
+            _info = self.tree[_id]
+            flag = Flag.DIR_INFO if _info.abspath.is_dir() else Flag.FILE_INFO
+            packet = Packet.load(flag, *_info)
             self.output_q.put(packet)
 
         # 将对端准备就绪的文件读入 output_q
-        finished = 0
+        n_files_sent = 0
         while True:
-            packet = self.input_q.get()
-            if packet.flag == Flag.FILE_READY:
-                f_id, = packet.unpack_body()
-                for chunk_packet in self.iread(f_id):
-                    self.output_q.put(chunk_packet)
-                finished += 1
-            elif packet.flag == Flag.DONE:
-                logging.info('client done')
+            try:
+                packet = self.input_q.get(timeout=TIMEOUT)
+            except Empty:
+                logging.error('[Reader] get input queue timeout, reader exit.')
                 break
             else:
-                logging.error(f'unknow packet: {packet}')
-
-        logging.info('Reader: all files finished')
+                if packet.flag == Flag.FILE_READY:
+                    f_id, = packet.unpack_body()
+                    for chunk_packet in self.tree[f_id].iread():
+                        self.output_q.put(chunk_packet)
+                    n_files_sent += 1
+                elif packet.flag == Flag.DONE:
+                    logging.info('[Reader] All files are processed, reader exit.')
+                    break
+                else:
+                    logging.error(f'[Reader] Unknow packet: {packet}')
 
 
 class Writer(Thread):

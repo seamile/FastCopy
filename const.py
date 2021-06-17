@@ -1,8 +1,7 @@
 from enum import Enum, IntEnum
 
 CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
-TIMEOUT = 30  # 全局超时时间
-
+TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
 EOF = 0xffffffff
@@ -24,11 +23,12 @@ class Flag(IntEnum):
     SID = 3         # 建立会话
     ATTACH = 4      # 后续连接
     FILE_COUNT = 5  # 文件总量
-    FILE_INFO = 6   # 文件信息
-    FILE_READY = 7  # 文件就绪
-    FILE_CHUNK = 8  # 数据传输
-    DONE = 9        # 完成
-    ERROR = 10      # 错误回传
+    DIR_INFO = 6    # 文件信息
+    FILE_INFO = 7   # 文件信息
+    FILE_READY = 8  # 文件就绪
+    FILE_CHUNK = 9  # 数据传输
+    DONE = 10       # 完成
+    ERROR = 11      # 错误回传
 
     @classmethod
     def contains(cls, member: object) -> bool:
