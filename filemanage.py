@@ -35,7 +35,7 @@ class DirInfo:
     @classmethod
     def load(cls, dir_id: int, fullpath: Path, relpath: Path):
         d_info = cls(dir_id, fullpath.stat().st_mode, bytes(relpath))
-        d_info.set_abspath(fullpath)
+        d_info.abspath = fullpath
         return d_info
 
     def set_abspath(self, parent: Path):
@@ -87,7 +87,7 @@ class FileInfo:
                      stat.st_mtime,  # 修改时间, 8 Bytes
                      cls.hash(fullpath),  # 文件 MD5 校验码
                      bytes(relpath))
-        f_info.set_abspath(fullpath)
+        f_info.abspath = fullpath
         return f_info
 
     def set_abspath(self, parent: Path):
@@ -299,7 +299,7 @@ class Writer(Thread):
         self.input_q = input_q
         self.output_q = output_q
 
-        self.dst_dir = Path()
+        self.base_dir = Path.home()
         self.size = 0
         self.total = 0
         self.n_recv = 0
@@ -309,28 +309,26 @@ class Writer(Thread):
 
     def check_dst_path(self):
         '''检查目标路径'''
-        if self.total <= 0:
-            raise ValueError
-
+        if self.total > 1:
+            # 多文件传输
+            self.base_dir = self.dst_path
+            self.base_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
         elif self.total == 1:
             # 单文件传输
             if self.dst_path.is_dir():
-                self.dst_dir = self.dst_path
+                self.base_dir = self.dst_path
             else:
-                self.dst_dir = self.dst_path.parent
-                self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
+                self.base_dir = self.dst_path.parent
+                self.base_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
                 self.use_custom_name = True
-
         else:
-            # 多文件传输
-            self.dst_dir = self.dst_path
-            self.dst_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
+            return
 
     def process_dir_info(self, packet: Packet):
         '''处理目录信息报文'''
         # 创建目录
         d_info = DirInfo(*packet.unpack_body())
-        d_info.set_abspath(self.dst_dir)
+        d_info.set_abspath(self.base_dir)
         d_info.make()
         # 接收数量 +1
         self.n_recv += 1
@@ -339,7 +337,10 @@ class Writer(Thread):
         '''处理文件信息报文'''
         # 解包，并创建 FileInfo 对象
         f_info = FileInfo(*packet.unpack_body())
-        f_info.set_abspath(self.dst_dir)
+        if self.use_custom_name:
+            f_info.abspath = self.dst_path
+        else:
+            f_info.set_abspath(self.base_dir)
 
         # 检查文件是否需要传输
         if f_info.abspath.is_file() and f_info.is_vaild():
@@ -384,7 +385,7 @@ class Writer(Thread):
         packet = self.input_q.get()
         if packet.flag == Flag.FILE_COUNT:
             # 取出文件总数，并确认目标路径
-            self.total, = packet.unpack_body()  # NOTE: unpack_body() 的结果是元组，所以等号前须有逗号
+            self.total, = packet.unpack_body()
             logging.info(f'[Writer] Num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
