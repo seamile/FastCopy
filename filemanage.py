@@ -392,12 +392,12 @@ class Writer(Thread):
         if now - self._last_time >= interval:
             delta_size = (current_size - self._last_size) / interval
             if delta_size < 1024:
-                speed = f'{delta_size} B/s'
+                speed = f'{delta_size:6.1f} B/s'
             elif delta_size < 1048576:
-                speed = f'{delta_size // 1024} KB/s'
+                speed = f'{delta_size // 1024:6.1f} KB/s'
             else:
-                speed = f'{delta_size // 1048576} MB/s'
-            logging.info(f'[Writer] Progress: {current_size / self.size: 7.2%}  {speed}')
+                speed = f'{delta_size // 1048576:6.1f} MB/s'
+            logging.info(f'Progress: {current_size / self.size: 7.2%}  {speed}')
             self._last_time = now
             self._last_size = current_size
 
