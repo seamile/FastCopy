@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 from glob import has_magic, iglob
 
@@ -8,7 +9,7 @@ from math import ceil
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
-from typing import Dict, Generator, Iterable, Tuple, Union
+from typing import Dict, Generator, Iterable, List, Tuple, Union
 
 from const import CHUNK_SIZE, EOF, Flag, TIMEOUT
 from network import Packet
@@ -71,7 +72,7 @@ class FileInfo:
         return self._values[index]
 
     def __str__(self) -> str:
-        return f'FileInfo(id={self.id}, perm={self.perm}, sz={self.size}, chk={self.chksum.hex()})'
+        return f'FileInfo(id={self.id}, perm={self.perm:o}, sz={self.size}, chk={self.chksum.hex()})'
 
     @property
     def n_chunks(self):
@@ -154,7 +155,7 @@ class FileInfo:
 class Reader(Thread):
     '''文件读取器'''
 
-    def __init__(self, src_paths: Tuple[str], input_q: Queue[Packet], output_q: Queue[Packet]):
+    def __init__(self, src_paths: List[str], input_q: Queue[Packet], output_q: Queue[Packet]):
         '''
         @src_path: 要读取的目标路径
         @input_q: 输入队列
@@ -346,7 +347,7 @@ class Writer(Thread):
         if f_info.abspath.is_file() and f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.debug(f'[Writer] File finished: {f_info.abspath}')
+            logging.info(f'[Writer] File finished: {f_info.abspath}')
         else:
             # 创建空文件
             f_info.touch()
@@ -358,7 +359,7 @@ class Writer(Thread):
             self.iwriters[f_info.id].send(None)
 
             # 通知对端：文件准备就绪
-            logging.debug(f'[Writer] File ready: {f_info}')
+            logging.info(f'[Writer] File ready: {f_info}')
             ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
             self.output_q.put(ready_pkt)
 
@@ -377,8 +378,28 @@ class Writer(Thread):
                 # 修改文件属性
                 self.files[f_id].set_stat()
                 self.n_recv += 1
-                logging.debug(f'[Writer] File finished: {self.files[f_id].abspath}')
+                logging.info(f'[Writer] File finished: {self.files[f_id].abspath}')
         return len(chunk)
+
+    def print_progess(self, current_size):
+        now = time.time()
+        interval = 3
+
+        if not hasattr(self, '_last_time'):
+            self._last_time = now
+            self._last_size = 0
+
+        if now - self._last_time >= interval:
+            delta_size = (current_size - self._last_size) / interval
+            if delta_size < 1024:
+                speed = f'{delta_size} B/s'
+            elif delta_size < 1048576:
+                speed = f'{delta_size // 1024} KB/s'
+            else:
+                speed = f'{delta_size // 1048576} MB/s'
+            logging.info(f'[Writer] Progress: {current_size / self.size: 7.2%}  {speed}')
+            self._last_time = now
+            self._last_size = current_size
 
     def run(self):
         # 等待接收文件总数数据包
@@ -404,7 +425,7 @@ class Writer(Thread):
 
             elif packet.flag == Flag.FILE_CHUNK:
                 recv_size += self.process_file_chunk(packet)
-                logging.info(f'[Writer] Progress: {recv_size / self.size: 7.2%}')
+                self.print_progess(recv_size)
 
             else:
                 logging.error(f'[Writer] Unknow packet flag: {packet.flag}')

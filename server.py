@@ -49,8 +49,8 @@ class WatchDog(Thread, NetworkMixin):
 
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
             # 创建 Transporter
-            dst_path, = packet.unpack_body()
-            transporter = self.server.create_transporter(packet.flag, dst_path)
+            path, = packet.unpack_body()
+            transporter = self.server.create_transporter(packet.flag, path)
             transporter.conn_pool.add(self.sock)
             transporter.start()
 
@@ -94,15 +94,15 @@ class Server(Thread):
             else:
                 return self.next_id
 
-    def create_transporter(self, cli_flag: Flag, dst_path: str) -> Transporter:
+    def create_transporter(self, cli_flag: Flag, path: str) -> Transporter:
         '''创建新 Transporter'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
-            logging.info(f'New task-{sid}: send {dst_path}')
-            self.transporters[sid] = Sender(sid, dst_path, self.max_conn)
+            logging.info(f'New task-{sid}: send {path}')
+            self.transporters[sid] = Sender(sid, path.split(','), self.max_conn)
         else:
-            logging.info(f'New task-{sid}: receive {dst_path}')
-            self.transporters[sid] = Receiver(sid, dst_path, self.max_conn)
+            logging.info(f'New task-{sid}: receive {path}')
+            self.transporters[sid] = Receiver(sid, path, self.max_conn)
         return self.transporters[sid]
 
     def close_all_transporters(self):

@@ -34,6 +34,9 @@ class Packet(NamedTuple):
             body = pack('>H', *args)
         elif flag == Flag.FILE_COUNT:
             body = pack('>H', *args)
+        elif flag == Flag.DIR_INFO:
+            length = len(args[-1])
+            body = pack(f'>2H{length}s', *args)
         elif flag == Flag.FILE_INFO:
             length = len(args[-1])
             body = pack(f'>2HQd16s{length}s', *args)
@@ -69,6 +72,12 @@ class Packet(NamedTuple):
 
         elif self.flag == Flag.FILE_COUNT:
             return unpack('>H', self.body)  # file count
+
+        elif self.flag == Flag.DIR_INFO:
+            # file_id | perm | path
+            #   2B    |  2B  |  ...
+            fmt = f'>2H{self.length - 4}s'
+            return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_INFO:
             # file_id | perm | size | mtime | chksum | path
