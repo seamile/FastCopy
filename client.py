@@ -107,7 +107,6 @@ def main(args):
 
 
 if __name__ == '__main__':
-    # Client 启动方式: fcp -c 100 host:/foo/bar ./loc/
     parser = ArgumentParser(
         prog='fcp',
         formatter_class=RawDescriptionHelpFormatter,
