@@ -2,6 +2,7 @@
 
 import sys
 import logging
+from os.path import abspath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter, BooleanOptionalAction
 from socket import socket, create_connection
 from textwrap import dedent
@@ -13,8 +14,8 @@ from transport import Sender, Receiver, Transporter
 
 
 class Client(NetworkMixin):
-    def __init__(self, src: str, dst: str, port: int, n_conn: int) -> None:
-        self.srcs = src
+    def __init__(self, srcs: str, dst: str, port: int, n_conn: int) -> None:
+        self.srcs = srcs
         self.dst = dst
         self.host = ''
         self.port = port
@@ -62,6 +63,7 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PULL, self.srcs)
+            self.dst = abspath(self.dst)
             self.transporter = Receiver(self.sid, self.dst, self.n_conn)
 
         elif ':' in self.dst:
@@ -71,6 +73,7 @@ class Client(NetworkMixin):
             # 建立连接, 并握手
             self.connect((self.host, self.port))
             self.handshake(Flag.PUSH, self.dst)
+            self.srcs = [abspath(path) for path in self.srcs]
             self.transporter = Sender(self.sid, self.srcs, self.n_conn)
 
         else:
@@ -88,11 +91,19 @@ class Client(NetworkMixin):
             sock.send(datagram)
             self.transporter.conn_pool.add(sock)
 
-    def launch(self):
-        self.init_conn()
-        self.create_parallel_connections()
-        self.transporter.start()
-        self.transporter.join()
+
+def main(args):
+    client = Client(args.src, args.dst, args.port, args.num)
+
+    try:
+        logging.info('[Client] Connecting to server')
+        client.init_conn()
+        client.create_parallel_connections()
+        client.transporter.start()
+        client.transporter.join()
+    except Exception as e:
+        logging.error(f'[Client] {e}, exit.')
+        sys.exit(1)
 
 
 if __name__ == '__main__':
@@ -115,8 +126,7 @@ if __name__ == '__main__':
     parser.add_argument(dest='dst', help='destination path')
 
     args = parser.parse_args()
-    log_level = logging.DEBUG if args.verbose else logging.WARNING
-    logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S', format='%(message)s')
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format='%(message)s')
 
-    cli = Client(args.src, args.dst, args.port, args.num)
-    cli.launch()
+    main(args)

@@ -39,6 +39,10 @@ class DirInfo:
         d_info.abspath = fullpath
         return d_info
 
+    @property
+    def s_relpath(self):
+        return self.relpath.decode('utf8')
+
     def set_abspath(self, parent: Path):
         '''设置绝对路径'''
         self.abspath = parent.joinpath(self.relpath.decode('utf8'))
@@ -91,9 +95,13 @@ class FileInfo:
         f_info.abspath = fullpath
         return f_info
 
+    @property
+    def s_relpath(self):
+        return self.relpath.decode('utf8')
+
     def set_abspath(self, parent: Path):
         '''设置绝对路径'''
-        self.abspath = parent.joinpath(self.relpath.decode('utf8'))
+        self.abspath = parent.joinpath(self.s_relpath)
         return self.abspath
 
     def set_stat(self):
@@ -108,14 +116,14 @@ class FileInfo:
         if self.abspath.is_file():
             st = self.abspath.stat()
             if st.st_size > self.size:
-                logging.debug(f'[FileInfo] truncate file {self.abspath}')
+                logging.debug(f'[FileInfo] truncate file {self.s_relpath}')
                 with open(self.abspath, 'rb+') as fp:
                     fp.truncate(self.size)
             else:
                 logging.debug(f'[FileInfo] file {self.abspath} exists')
         else:
             # 文件不存在时，创建空文件
-            logging.debug(f'[FileInfo] make file {self.abspath}')
+            logging.debug(f'[FileInfo] make file {self.s_relpath}')
             open(self.abspath, 'w').close()
 
     def iread(self) -> Generator[Packet, None, None]:
@@ -207,17 +215,20 @@ class Reader(Thread):
     def checkout_paths(cls, fullpath: Path, include: str, excludes: Iterable[str]) \
             -> Generator[Tuple[Path, Path], None, None]:
         '''检出路径'''
-        if fullpath.is_file():
-            relpath = fullpath.relative_to(fullpath.parent)
-            if not cls.need_exclude(relpath, excludes):
-                yield fullpath, relpath
-        elif fullpath.is_dir():
-            for sub_path in cls.traverse_directory(fullpath, include):
-                relpath = sub_path.relative_to(fullpath)
+        if fullpath.exists():
+            if fullpath.is_file():
+                relpath = fullpath.relative_to(fullpath.parent)
                 if not cls.need_exclude(relpath, excludes):
-                    yield sub_path, relpath
+                    yield fullpath, relpath
+            elif fullpath.is_dir():
+                for sub_path in cls.traverse_directory(fullpath, include):
+                    relpath = sub_path.relative_to(fullpath)
+                    if not cls.need_exclude(relpath, excludes):
+                        yield sub_path, relpath
+            else:
+                logging.error(f'[Reader] The `{fullpath}` is not a regular file or dir.')
         else:
-            logging.debug(f'[Reader] The `{fullpath}` is not a regular file or dir.')
+            logging.error(f'[Reader] No such file or directory: `{fullpath}`.')
 
     @classmethod
     def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
@@ -296,7 +307,7 @@ class Writer(Thread):
         '''
         super().__init__(daemon=True)
 
-        self.dst_path = Path(dst_path).absolute()
+        self.dst_path = Reader.abspath(dst_path)
         self.input_q = input_q
         self.output_q = output_q
 
@@ -347,21 +358,26 @@ class Writer(Thread):
         if f_info.abspath.is_file() and f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.info(f'[Writer] File finished: {f_info.abspath}')
+            logging.info(f'[Writer] File finished: {f_info.s_relpath}')
         else:
             # 创建空文件
             f_info.touch()
-            self.files[f_info.id] = f_info
-            self.size += f_info.size
+            if f_info.size > 0:
+                self.files[f_info.id] = f_info
+                self.size += f_info.size
 
-            # 创建并启动写入迭代器
-            self.iwriters[f_info.id] = f_info.iwrite()
-            self.iwriters[f_info.id].send(None)
+                # 创建并启动写入迭代器
+                self.iwriters[f_info.id] = f_info.iwrite()
+                self.iwriters[f_info.id].send(None)
 
-            # 通知对端：文件准备就绪
-            logging.info(f'[Writer] File ready: {f_info}')
-            ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
-            self.output_q.put(ready_pkt)
+                # 通知对端：文件准备就绪
+                logging.info(f'[Writer] File ready: {f_info}')
+                ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
+                self.output_q.put(ready_pkt)
+            else:
+                f_info.set_stat()
+                self.n_recv += 1
+                logging.info(f'[Writer] File finished: {f_info.s_relpath}')
 
     def process_file_chunk(self, packet: Packet):
         '''处理文件数据块'''
@@ -373,12 +389,12 @@ class Writer(Thread):
             # 检查文件 Hash
             if not self.files[f_id].is_vaild():
                 # TODO: 错误重传机制
-                logging.error(f'[Writer] File hash error: {self.files[f_id].abspath}')
+                logging.error(f'[Writer] File hash error: {self.files[f_id].s_relpath}')
             else:
                 # 修改文件属性
                 self.files[f_id].set_stat()
                 self.n_recv += 1
-                logging.info(f'[Writer] File finished: {self.files[f_id].abspath}')
+                logging.info(f'[Writer] File finished: {self.files[f_id].s_relpath}')
         return len(chunk)
 
     def print_progess(self, current_size):
