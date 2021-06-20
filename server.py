@@ -43,7 +43,7 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
-            logging.debug('waiting timeout')
+            logging.debug('[WatchDog] handshake timeout, exit.')
             self.sock.close()
             return
 
@@ -58,7 +58,6 @@ class WatchDog(Thread, NetworkMixin):
             self.send_msg(Flag.SID, transporter.sid)
 
         elif packet.flag == Flag.ATTACH:
-            logging.debug('run as a follower')
             sid, = packet.unpack_body()
             if not self.server.transporters[sid].conn_pool.add(self.sock):
                 self.sock.close()
@@ -98,27 +97,27 @@ class Server(Thread):
         '''创建新 Transporter'''
         sid = self.geneate_sid()
         if cli_flag == Flag.PULL:
-            logging.info(f'New task-{sid}: send {path}')
+            logging.info(f'[Server] New task-{sid} for send {path}')
             self.transporters[sid] = Sender(sid, path.split(','), self.max_conn)
         else:
-            logging.info(f'New task-{sid}: receive {path}')
+            logging.info(f'[Server] New task-{sid} for recv {path}')
             self.transporters[sid] = Receiver(sid, path, self.max_conn)
         return self.transporters[sid]
 
     def close_all_transporters(self):
         '''关闭所有 Transporter'''
-        logging.debug('closing transporters')
+        logging.info('[Server] Closing all transporters.')
         for transporter in self.transporters.values():
             transporter.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
-        logging.info('Server is running at %s:%d' % self.addr)
+        logging.info('[Server] Listening to %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
-            logging.debug('waitting for new connections')
+            logging.debug('[Server] Waitting for new connections')
             cli_sock, cli_addr = self.srv_sock.accept()
-            logging.debug('accept new connection: %s:%s' % cli_addr)
+            logging.debug('[Server] Accept new connection: %s:%s' % cli_addr)
 
             # launch a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
@@ -144,13 +143,13 @@ if __name__ == '__main__':
     if args.daemon:
         with daemon.DaemonContext():
             logging.basicConfig(filename='/tmp/fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
-                                format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
+                                format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
             server = Server(args.bind, args.port, args.concurrency)
             server.start()
             server.join()
     else:
         logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
-                            format='%(asctime)s %(levelname)4.4s %(module)s.%(lineno)s: %(message)s')
+                            format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
         server = Server(args.bind, args.port, args.concurrency)
         server.start()
         server.join()

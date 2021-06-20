@@ -53,7 +53,7 @@ class DirInfo:
         self.abspath.chmod(self.perm)
 
     def make(self):
-        logging.info(f'[DirInfo] Make dir: {self.s_relpath}')
+        logging.debug(f'[DirInfo] Make dir: {self.s_relpath}')
         self.abspath.mkdir(parents=True, exist_ok=True)
         self.abspath.chmod(self.perm)
 
@@ -120,11 +120,9 @@ class FileInfo:
                 logging.debug(f'[FileInfo] Truncate file {self.s_relpath}')
                 with open(self.abspath, 'rb+') as fp:
                     fp.truncate(self.size)
-            else:
-                logging.debug(f'[FileInfo] File {self.s_relpath} exists')
         else:
             # 文件不存在时，创建空文件
-            logging.info(f'[FileInfo] Create file {self.s_relpath}')
+            logging.debug(f'[FileInfo] Create file {self.s_relpath}')
             open(self.abspath, 'w').close()
 
     def iread(self) -> Generator[Packet, None, None]:
@@ -360,7 +358,7 @@ class Writer(Thread):
         if f_info.abspath.is_file() and f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.info(f'[Writer] File finished: {f_info.s_relpath}')
+            logging.info(f'[Writer] File exists: {f_info.s_relpath}, skip.')
         else:
             # 创建空文件
             f_info.touch()
@@ -377,6 +375,7 @@ class Writer(Thread):
                 ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
                 self.output_q.put(ready_pkt)
             else:
+                # 传输的是空文件，直接标记为完成
                 f_info.set_stat()
                 self.n_recv += 1
                 logging.info(f'[Writer] File finished: {f_info.s_relpath}')
@@ -385,18 +384,18 @@ class Writer(Thread):
         '''处理文件数据块'''
         f_id, seq, chunk = packet.unpack_body()
         try:
-            logging.debug(f'[Writer] Write file: {f_id=} {seq=}')
+            logging.debug(f'[Writer] Write chunk({seq}) into {self.files[f_id].s_relpath}')
             self.iwriters[f_id].send((seq, chunk))
         except StopIteration:
             # 检查文件 Hash
-            if not self.files[f_id].is_vaild():
-                # TODO: 错误重传机制
-                logging.error(f'[Writer] File hash error: {self.files[f_id].s_relpath}')
-            else:
-                # 修改文件属性
-                self.files[f_id].set_stat()
+            if self.files[f_id].is_vaild():
+                self.files[f_id].set_stat()  # 修改文件状态
                 self.n_recv += 1
                 logging.info(f'[Writer] File finished: {self.files[f_id].s_relpath}')
+            else:
+                # TODO: 错误重传机制
+                logging.error(f'[Writer] File hash error: {self.files[f_id].s_relpath}')
+
         return len(chunk)
 
     def print_progess(self, current_size):
@@ -421,11 +420,12 @@ class Writer(Thread):
 
     def run(self):
         # 等待接收文件总数数据包
+        logging.info('[Writer] Waitting for the total number of files')
         packet = self.input_q.get()
         if packet.flag == Flag.FILE_COUNT:
             # 取出文件总数，并确认目标路径
             self.total, = packet.unpack_body()
-            logging.info(f'[Writer] Num of files and dirs: {self.total}')
+            logging.info(f'[Writer] Total num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
             logging.error('[Writer] The first packet must be `FILE_COUNT`')

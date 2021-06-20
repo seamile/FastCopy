@@ -11,7 +11,6 @@ class Sender(Thread):
         super().__init__(daemon=True)
 
         self.sid = sid
-
         self.conn_pool = ConnectionPool(pool_size)
         self.reader = Reader(src_paths, self.conn_pool.recv_q, self.conn_pool.send_q)
 
@@ -30,7 +29,6 @@ class Receiver(Thread):
         super().__init__(daemon=True)
 
         self.sid = sid
-
         self.conn_pool = ConnectionPool(pool_size)
         self.writer = Writer(dst_path, self.conn_pool.recv_q, self.conn_pool.send_q)
 

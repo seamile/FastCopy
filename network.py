@@ -185,11 +185,11 @@ class ConnectionPool:
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
             try:
-                packet = self.send_q.get(timeout=0.5)
+                packet = self.send_q.get(timeout=1)
             except Empty:
                 continue  # 队列为空，直接进入下轮循环
             else:
-                for key, _ in self.sender.select(timeout=0.5):
+                for key, _ in self.sender.select(timeout=1):
                     logging.debug(f'<- {packet.flag.name}: length={packet.length}')
                     msg = packet.pack()
                     try:
@@ -235,6 +235,7 @@ class ConnectionPool:
 
     def close_all(self):
         '''关闭所有连接'''
+        logging.info('[ConnectionPool] closing all connections')
         self.is_working = False
         for t in self.threads:
             t.join()
