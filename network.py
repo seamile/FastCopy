@@ -129,8 +129,8 @@ class ConnectionPool:
     def __init__(self, size: int = 256) -> None:
         self.size = size
         # 发送、接收队列
-        self.send_q: Queue[Packet] = Queue(size * 2)
-        self.recv_q: Queue[Packet] = Queue(size * 2)
+        self.send_q: Queue[Packet] = Queue(size * 5)
+        self.recv_q: Queue[Packet] = Queue(size * 5)
 
         # 所有 Socket
         self.socks: Set[socket] = set()

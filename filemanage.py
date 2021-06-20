@@ -31,7 +31,7 @@ class DirInfo:
         return self._values[index]
 
     def __str__(self) -> str:
-        return f'FileInfo(id={self.id}, perm={self.perm})'
+        return f'DirInfo(id={self.id}, perm={self.perm}, path={self.s_relpath})'
 
     @classmethod
     def load(cls, dir_id: int, fullpath: Path, relpath: Path):
@@ -53,6 +53,7 @@ class DirInfo:
         self.abspath.chmod(self.perm)
 
     def make(self):
+        logging.info(f'[DirInfo] Make dir: {self.s_relpath}')
         self.abspath.mkdir(parents=True, exist_ok=True)
         self.abspath.chmod(self.perm)
 
@@ -76,7 +77,7 @@ class FileInfo:
         return self._values[index]
 
     def __str__(self) -> str:
-        return f'FileInfo(id={self.id}, perm={self.perm:o}, sz={self.size}, chk={self.chksum.hex()})'
+        return f'FileInfo(id={self.id}, perm={self.perm:o}, sz={self.size}, path={self.s_relpath})'
 
     @property
     def n_chunks(self):
@@ -116,14 +117,14 @@ class FileInfo:
         if self.abspath.is_file():
             st = self.abspath.stat()
             if st.st_size > self.size:
-                logging.debug(f'[FileInfo] truncate file {self.s_relpath}')
+                logging.debug(f'[FileInfo] Truncate file {self.s_relpath}')
                 with open(self.abspath, 'rb+') as fp:
                     fp.truncate(self.size)
             else:
-                logging.debug(f'[FileInfo] file {self.abspath} exists')
+                logging.debug(f'[FileInfo] File {self.s_relpath} exists')
         else:
             # 文件不存在时，创建空文件
-            logging.debug(f'[FileInfo] make file {self.s_relpath}')
+            logging.info(f'[FileInfo] Create file {self.s_relpath}')
             open(self.abspath, 'w').close()
 
     def iread(self) -> Generator[Packet, None, None]:
@@ -226,9 +227,9 @@ class Reader(Thread):
                     if not cls.need_exclude(relpath, excludes):
                         yield sub_path, relpath
             else:
-                logging.error(f'[Reader] The `{fullpath}` is not a regular file or dir.')
+                logging.error(f'[Reader] The {fullpath} is not a regular file or dir.')
         else:
-            logging.error(f'[Reader] No such file or directory: `{fullpath}`.')
+            logging.error(f'[Reader] No such file or directory: {fullpath}.')
 
     @classmethod
     def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
@@ -254,10 +255,10 @@ class Reader(Thread):
                     relpaths.add(relpath)
                     inf_cls = FileInfo if fullpath.is_file() else DirInfo
                     self.tree[_id] = inf_cls.load(_id, fullpath, relpath)
-                    logging.debug(f'[Reader] Found {inf_cls.__name__}: id={_id} path={fullpath.as_posix()}')
+                    logging.debug(f'[Reader] Found {inf_cls.__name__}: id={_id} path={relpath.as_posix()}')
                     _id += 1
                 else:
-                    logging.debug(f'[Reader] Name conflict: `{relpath.as_posix()}`, ignore `{fullpath.as_posix()}`')
+                    logging.debug(f'[Reader] Name conflict: {relpath.as_posix()}, ignore.')
 
         return _id  # _id == n_files + n_dirs
 
@@ -342,6 +343,7 @@ class Writer(Thread):
         d_info = DirInfo(*packet.unpack_body())
         d_info.set_abspath(self.base_dir)
         d_info.make()
+        logging.info(f'[Writer] Dir ready: {d_info}')
         # 接收数量 +1
         self.n_recv += 1
 
