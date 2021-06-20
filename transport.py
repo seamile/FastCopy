@@ -1,19 +1,19 @@
 import logging
 from threading import Thread
-from typing import Union
+from typing import List, Union
 
 from filemanage import Reader, Writer
 from network import ConnectionPool
 
 
 class Sender(Thread):
-    def __init__(self, sid: int, src_path: str, pool_size: int) -> None:
+    def __init__(self, sid: int, src_paths: List[str], pool_size: int) -> None:
         super().__init__(daemon=True)
 
         self.sid = sid
 
         self.conn_pool = ConnectionPool(pool_size)
-        self.reader = Reader(src_path, self.conn_pool.recv_q, self.conn_pool.send_q)
+        self.reader = Reader(src_paths, self.conn_pool.recv_q, self.conn_pool.send_q)
 
     def run(self):
         logging.info(f'Sender({self.sid}) is running')
