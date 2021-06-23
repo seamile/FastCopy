@@ -2,14 +2,15 @@ import os
 import re
 import time
 import logging
+from collections import deque
 from glob import has_magic, iglob
-
 from hashlib import md5
 from math import ceil
 from pathlib import Path
 from queue import Empty, Queue
+from threading import Semaphore
 from threading import Thread
-from typing import Dict, Generator, Iterable, List, Tuple, Union
+from typing import Deque, Dict, Generator, Iterable, List, Tuple, Union
 
 from const import CHUNK_SIZE, EOF, Flag, TIMEOUT
 from network import Packet
@@ -43,8 +44,8 @@ class DirInfo:
     def s_relpath(self):
         return self.relpath.decode('utf8')
 
-    def set_abspath(self, parent: Path):
-        '''设置绝对路径'''
+    def set_parent(self, parent: Path):
+        '''通过上级目录设置绝对路径'''
         self.abspath = parent.joinpath(self.relpath.decode('utf8'))
         return self.abspath
 
@@ -100,8 +101,8 @@ class FileInfo:
     def s_relpath(self):
         return self.relpath.decode('utf8')
 
-    def set_abspath(self, parent: Path):
-        '''设置绝对路径'''
+    def set_parent(self, parent: Path):
+        '''通过上级目录设置绝对路径'''
         self.abspath = parent.joinpath(self.s_relpath)
         return self.abspath
 
@@ -114,16 +115,12 @@ class FileInfo:
 
     def touch(self):
         '''创建空文件'''
-        if self.abspath.is_file():
-            st = self.abspath.stat()
-            if st.st_size > self.size:
-                logging.debug(f'[FileInfo] Truncate file {self.s_relpath}')
-                with open(self.abspath, 'rb+') as fp:
-                    fp.truncate(self.size)
-        else:
-            # 文件不存在时，创建空文件
-            logging.debug(f'[FileInfo] Create file {self.s_relpath}')
+        # 确保文件的上级目录存在
+        self.abspath.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        if not self.abspath.exists():
             open(self.abspath, 'w').close()
+            self.set_stat()
 
     def iread(self) -> Generator[Packet, None, None]:
         '''封装文件数据块报文'''
@@ -135,16 +132,21 @@ class FileInfo:
 
     def iwrite(self) -> Generator[None, Tuple[int, bytes], None]:
         '''按数据块迭代写入'''
+        # 确保文件的上级目录存在
+        self.abspath.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        # 定义文件所有数据块编号集
         seqs = {i for i in range(self.n_chunks)}
-        with open(self.abspath, 'rb+') as fp:
+
+        # 开始迭代写入
+        mode = 'rb+' if self.abspath.is_file() else 'wb'
+        with open(self.abspath, mode) as fp:
             while seqs:
                 seq, chunk = yield
                 if seq in seqs:
                     fp.seek(seq * CHUNK_SIZE)
                     fp.write(chunk)
                     seqs.remove(seq)
-                else:
-                    raise ValueError
 
     @staticmethod
     def hash(filepath: Path) -> bytes:
@@ -156,7 +158,7 @@ class FileInfo:
 
     def is_vaild(self):
         '''检查文件校验和'''
-        return self.hash(self.abspath) == self.chksum
+        return self.abspath.is_file() and self.hash(self.abspath) == self.chksum
 
 
 class Reader(Thread):
@@ -314,36 +316,53 @@ class Writer(Thread):
         self.size = 0
         self.total = 0
         self.n_recv = 0
+        self.use_custom_name = False
+        self.concurrency = Semaphore(32)  # 允许同时写入的文件数
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
-        self.use_custom_name = False
+        self.ready_files: Deque[int] = deque()
 
     def check_dst_path(self):
         '''检查目标路径'''
         if self.total > 1:
             # 多文件传输
             self.base_dir = self.dst_path
-            self.base_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
+            self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)  # 确保保存目录存在
         elif self.total == 1:
             # 单文件传输
             if self.dst_path.is_dir():
                 self.base_dir = self.dst_path
             else:
                 self.base_dir = self.dst_path.parent
-                self.base_dir.mkdir(parents=True, exist_ok=True)  # 确保保存目录存在
+                self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)  # 确保保存目录存在
                 self.use_custom_name = True
-        else:
-            return
 
     def process_dir_info(self, packet: Packet):
         '''处理目录信息报文'''
         # 创建目录
         d_info = DirInfo(*packet.unpack_body())
-        d_info.set_abspath(self.base_dir)
+        d_info.set_parent(self.base_dir)
         d_info.make()
         logging.info(f'[Writer] Dir ready: {d_info}')
         # 接收数量 +1
         self.n_recv += 1
+
+    def ready_notice(self):
+        '''通知对端文件准备就绪'''
+        while self.ready_files:
+            if self.concurrency.acquire(False):
+                f_id = self.ready_files[0]
+                # 创建写入迭代器
+                self.iwriters[f_id] = self.files[f_id].iwrite()
+                self.iwriters[f_id].send(None)
+
+                # 通知对端：文件准备就绪
+                logging.info(f'[Writer] File({f_id}) ready')
+                ready_pkt = Packet.load(Flag.FILE_READY, f_id)
+                self.output_q.put(ready_pkt)
+                self.ready_files.popleft()
+            else:
+                break
 
     def process_file_info(self, packet: Packet):
         '''处理文件信息报文'''
@@ -352,49 +371,54 @@ class Writer(Thread):
         if self.use_custom_name:
             f_info.abspath = self.dst_path
         else:
-            f_info.set_abspath(self.base_dir)
+            f_info.set_parent(self.base_dir)
 
         # 检查文件是否需要传输
-        if f_info.abspath.is_file() and f_info.is_vaild():
+        if f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.info(f'[Writer] File exists: {f_info.s_relpath}, skip.')
+            logging.info(f'[Writer] File skiped: {f_info.s_relpath}.')
         else:
-            # 创建空文件
-            f_info.touch()
             if f_info.size > 0:
                 self.files[f_info.id] = f_info
                 self.size += f_info.size
-
-                # 创建并启动写入迭代器
-                self.iwriters[f_info.id] = f_info.iwrite()
-                self.iwriters[f_info.id].send(None)
-
-                # 通知对端：文件准备就绪
-                logging.info(f'[Writer] File ready: {f_info}')
-                ready_pkt = Packet.load(Flag.FILE_READY, f_info.id)
-                self.output_q.put(ready_pkt)
+                self.ready_files.append(f_info.id)  # 将 f_id 加入待通知队列
+                self.ready_notice()
             else:
                 # 传输的是空文件，直接标记为完成
-                f_info.set_stat()
+                f_info.touch()
                 self.n_recv += 1
                 logging.info(f'[Writer] File finished: {f_info.s_relpath}')
+
+    def get_iwriter(self, f_id):
+        '''获取写入迭代器'''
+        if f_id not in self.iwriters:
+            f_info = self.files[f_id]
+            # 创建并启动写入迭代器
+            self.iwriters[f_id] = f_info.iwrite()
+            self.iwriters[f_id].send(None)
+        return self.iwriters[f_id]
 
     def process_file_chunk(self, packet: Packet):
         '''处理文件数据块'''
         f_id, seq, chunk = packet.unpack_body()
         try:
             logging.debug(f'[Writer] Write chunk({seq}) into {self.files[f_id].s_relpath}')
-            self.iwriters[f_id].send((seq, chunk))
+            iwriter = self.get_iwriter(f_id)
+            iwriter.send((seq, chunk))
         except StopIteration:
+            # 释放并发计数器
+            self.concurrency.release()
             # 检查文件 Hash
             if self.files[f_id].is_vaild():
                 self.files[f_id].set_stat()  # 修改文件状态
                 self.n_recv += 1
+                self.iwriters.pop(f_id)
+                self.ready_notice()
                 logging.info(f'[Writer] File finished: {self.files[f_id].s_relpath}')
             else:
                 # TODO: 错误重传机制
-                logging.error(f'[Writer] File hash error: {self.files[f_id].s_relpath}')
+                logging.error(f'[Writer] Bad file hash: {self.files[f_id].s_relpath}')
 
         return len(chunk)
 
@@ -428,7 +452,7 @@ class Writer(Thread):
             logging.info(f'[Writer] Total num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
-            logging.error('[Writer] The first packet must be `FILE_COUNT`')
+            logging.error('[Writer] The first packet must be `FILE_COUNT` but receive `{packet.flag.name}`')
             return
 
         # 等待接收文件信息和数据

@@ -28,7 +28,7 @@ class Flag(IntEnum):
     FILE_READY = 8  # 文件就绪
     FILE_CHUNK = 9  # 数据传输
     DONE = 10       # 完成
-    ERROR = 11      # 错误回传
+    RESEND = 11     # 错误回传
 
     @classmethod
     def contains(cls, member: object) -> bool:

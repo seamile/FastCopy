@@ -5,7 +5,7 @@ from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from socket import socket, create_connection, MSG_WAITALL
 from struct import pack, unpack
 from threading import Thread
-from typing import Any, List, NamedTuple, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Set, Tuple
 
 from const import EOF, PacketSnippet, Flag, LEN_HEAD
 
@@ -55,6 +55,10 @@ class Packet(NamedTuple):
         '''封包'''
         fmt = f'>BIH{self.length}s'
         return pack(fmt, self.flag, self.chksum, self.length, self.body)
+
+    @staticmethod
+    def gen_head(flag: Flag, chksum: int, length: int):
+        return pack('>BIH', flag, chksum, length)
 
     @staticmethod
     def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
@@ -125,6 +129,13 @@ class Buffer:
         self.data.clear()
 
 
+class PacketCache:
+    def __init__(self) -> None:
+        self.head = bytearray()
+        self.body = bytearray()
+        self.sent: Dict[bytes, bytes] = {}  # 已发送的包
+
+
 class ConnectionPool:
     def __init__(self, size: int = 256) -> None:
         self.size = size
@@ -176,7 +187,10 @@ class ConnectionPool:
             logging.debug(f'-> {pkt.flag.name}: length={pkt.length}')
             self.recv_q.put(pkt)  # 正确的数据包放入队列
         else:
-            logging.debug('错误的包，丢弃')
+            logging.error('丢弃错误包，请求重传')
+            head = Packet.gen_head(buf.flag, buf.chksum, pkt.length)
+            resend_pkt = Packet(Flag.RESEND, head)
+            self.send_q.put(resend_pkt)
 
         # 一个数据包解析完成后，重置 buf
         buf.reset()
@@ -280,8 +294,7 @@ class NetworkMixin:
 
         # 错误重传
         if crc32(body) != chksum:
-            # TODO: 错误处理不够完善
-            self.send_msg(Flag.ERROR, head)
-            raise ValueError
+            self.send_msg(Flag.RESEND, head)
+            return self.recv_msg()
 
         return Packet(flag, body)
