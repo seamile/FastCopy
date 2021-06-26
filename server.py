@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
-import daemon
 import socket
 import logging
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import wraps
 from threading import Lock, Thread
 from typing import Dict
+
+import daemon
 
 from const import Flag
 from network import NetworkMixin
@@ -125,11 +126,10 @@ class Server(Thread):
 
 
 if __name__ == '__main__':
-    # Server 启动方式: fcpd -h host -p port -c 128
     parser = ArgumentParser()
-    parser.add_argument('-b', dest='bind', metavar='IP_ADDRESS', type=str, default='0.0.0.0',
+    parser.add_argument('-b', dest='bind', metavar='IP_ADDRESS', type=str, default='127.0.0.1',
                         help='the IP address to bind')
-    parser.add_argument('-p', dest='port', type=int, default=7325,
+    parser.add_argument('-p', dest='port', type=int, default=35897,
                         help='accept connections on this port')
     parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=256,
                         help='maximum concurrent connections')

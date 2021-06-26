@@ -29,7 +29,10 @@ class Packet(NamedTuple):
     def load(flag: Flag, *args) -> 'Packet':
         '''将包体封包'''
         if flag == Flag.PULL or flag == Flag.PUSH:
-            body = args[0] if isinstance(args[0], bytes) else str(args[0]).encode('utf8')
+            if isinstance(args[0], bytes):
+                body = args[0]
+            else:
+                body = str(args[0]).encode('utf8')
         elif flag == Flag.SID or flag == Flag.ATTACH:
             body = pack('>H', *args)
         elif flag == Flag.FILE_COUNT:
@@ -47,6 +50,8 @@ class Packet(NamedTuple):
             body = pack(f'>HI{length}s', *args)
         elif flag == Flag.DONE:
             body = pack('>I', EOF)
+        elif flag == Flag.RESEND:
+            body = pack('>BIH', *args)
         else:
             raise ValueError('Invalid flag')
         return Packet(flag, body)
@@ -55,10 +60,6 @@ class Packet(NamedTuple):
         '''封包'''
         fmt = f'>BIH{self.length}s'
         return pack(fmt, self.flag, self.chksum, self.length, self.body)
-
-    @staticmethod
-    def gen_head(flag: Flag, chksum: int, length: int):
-        return pack('>BIH', flag, chksum, length)
 
     @staticmethod
     def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
@@ -100,6 +101,9 @@ class Packet(NamedTuple):
 
         elif self.flag == Flag.DONE:
             return unpack('>I', self.body)
+
+        elif self.flag == Flag.RESEND:
+            return unpack('>BIH', self.body)
 
         else:
             raise TypeError
@@ -184,12 +188,11 @@ class ConnectionPool:
         pkt = Packet(buf.flag, bytes(buf.data))
         # 检查校验码
         if pkt.is_valid(buf.chksum):
-            logging.debug(f'-> {pkt.flag.name}: length={pkt.length}')
+            logging.debug(f'-> {pkt.flag.name}: length={pkt.length} chksum={pkt.chksum}')
             self.recv_q.put(pkt)  # 正确的数据包放入队列
         else:
             logging.error('丢弃错误包，请求重传')
-            head = Packet.gen_head(buf.flag, buf.chksum, pkt.length)
-            resend_pkt = Packet(Flag.RESEND, head)
+            resend_pkt = Packet.load(Flag.RESEND, buf.flag, buf.chksum, pkt.length)
             self.send_q.put(resend_pkt)
 
         # 一个数据包解析完成后，重置 buf
@@ -204,7 +207,7 @@ class ConnectionPool:
                 continue  # 队列为空，直接进入下轮循环
             else:
                 for key, _ in self.sender.select(timeout=1):
-                    logging.debug(f'<- {packet.flag.name}: length={packet.length}')
+                    logging.debug(f'<- {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
                     msg = packet.pack()
                     try:
                         key.fileobj.send(msg)
