@@ -9,7 +9,7 @@ from typing import Dict
 
 import daemon
 
-from const import Flag
+from const import Flag, SERVER_ADDR
 from network import NetworkMixin
 from transport import Sender, Receiver, Transporter
 
@@ -71,9 +71,9 @@ class WatchDog(Thread, NetworkMixin):
 
 @singleton
 class Server(Thread):
-    def __init__(self, host: str, port: int, max_conn=256) -> None:
+    def __init__(self, max_conn=256) -> None:
         super().__init__(daemon=True)
-        self.addr = (host, port)
+        self.addr = SERVER_ADDR
         self.max_transporters = 65535  # 最大 Transporter 数量，与 Session ID 相关
         self.max_conn = max_conn  # 一个 Transporter 的最大连接数
         self.is_running = True
@@ -127,11 +127,7 @@ class Server(Thread):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('-b', dest='bind', metavar='IP_ADDRESS', type=str, default='127.0.0.1',
-                        help='the IP address to bind')
-    parser.add_argument('-p', dest='port', type=int, default=35897,
-                        help='accept connections on this port')
-    parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=256,
+    parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=128,
                         help='maximum concurrent connections')
     parser.add_argument('-d', dest='daemon', type=bool, action=BooleanOptionalAction,
                         help='daemon mode')
@@ -144,12 +140,12 @@ if __name__ == '__main__':
         with daemon.DaemonContext():
             logging.basicConfig(filename='/tmp/fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
                                 format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
-            server = Server(args.bind, args.port, args.concurrency)
+            server = Server(args.concurrency)
             server.start()
             server.join()
     else:
         logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
                             format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
-        server = Server(args.bind, args.port, args.concurrency)
+        server = Server(args.concurrency)
         server.start()
         server.join()

@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Union
 
 from sshtunnel import open_tunnel
 
-from const import Flag
+from const import Flag, SERVER_ADDR
 from network import NetworkMixin, Packet
 from transport import Sender, Receiver, Transporter
 
@@ -124,7 +124,7 @@ def main(parser: ArgumentParser):
                          ssh_password=args.password,
                          ssh_pkey=None,
                          ssh_private_key_password=None,
-                         remote_bind_address=('127.0.0.1', 7325),
+                         remote_bind_address=SERVER_ADDR,
                          compression=True)
     with tunnel:
         client = Client(action, srcs, dst, tunnel.local_bind_address, args.num)

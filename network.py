@@ -133,7 +133,7 @@ class Buffer:
         self.data.clear()
 
 
-class PacketCache:
+class Cookie:
     def __init__(self) -> None:
         self.head = bytearray()
         self.body = bytearray()
