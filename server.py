@@ -120,7 +120,7 @@ class Server(Thread):
             cli_sock, cli_addr = self.srv_sock.accept()
             logging.debug('[Server] Accept new connection: %s:%s' % cli_addr)
 
-            # launch a WatchDog for handshake
+            # create a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
             dog.start()
 

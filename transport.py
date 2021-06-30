@@ -16,11 +16,11 @@ class Sender(Thread):
 
     def run(self):
         logging.info(f'Sender({self.sid}) is running')
-        self.conn_pool.launch()  # 启动网络连接池
+        self.conn_pool.start()  # 启动网络连接池
         self.reader.start()  # 启动读取线程
 
         self.reader.join()
-        self.conn_pool.close_all()
+        self.conn_pool.stop()
         logging.info(f'Sender({self.sid}) exit')
 
 
@@ -34,11 +34,11 @@ class Receiver(Thread):
 
     def run(self):
         logging.info(f'Receiver({self.sid}) is running')
-        self.conn_pool.launch()  # 启动连接池
+        self.conn_pool.start()  # 启动连接池
         self.writer.start()  # 启动写入线程
 
         self.writer.join()
-        self.conn_pool.close_all()
+        self.conn_pool.stop()
         logging.info(f'Receiver({self.sid}) exit')
 
 

@@ -2,7 +2,7 @@ import logging
 from binascii import crc32
 from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from socket import socket, create_connection, MSG_WAITALL
+from socket import socket, MSG_WAITALL
 from struct import pack, unpack
 from threading import Thread
 from typing import Any, Dict, List, NamedTuple, Set, Tuple
@@ -141,11 +141,14 @@ class Cookie:
 
 
 class ConnectionPool:
-    def __init__(self, size: int = 256) -> None:
-        self.size = size
+    max_size = 128
+    timeout = 0.001  # 1ms
+
+    def __init__(self, size: int) -> None:
+        self.size = min(size, self.max_size)
         # 发送、接收队列
-        self.send_q: Queue[Packet] = Queue(size * 5)
-        self.recv_q: Queue[Packet] = Queue(size * 5)
+        self.send_q: Queue[Packet] = Queue(self.size * 5)
+        self.recv_q: Queue[Packet] = Queue(self.size * 5)
 
         # 所有 Socket
         self.socks: Set[socket] = set()
@@ -156,6 +159,14 @@ class ConnectionPool:
 
         self.is_working = True
         self.threads: List[Thread] = []
+
+    def send(self, packet: Packet):
+        '''发送'''
+        self.send_q.put(packet)
+
+    def recv(self, block=True, timeout=None) -> Packet:
+        '''接收'''
+        return self.recv_q.get(block, timeout)
 
     def add(self, sock: socket):
         '''添加 sock'''
@@ -198,33 +209,34 @@ class ConnectionPool:
         # 一个数据包解析完成后，重置 buf
         buf.reset()
 
-    def send(self):
+    def _send(self):
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
-            try:
-                packet = self.send_q.get(timeout=1)
-            except Empty:
-                continue  # 队列为空，直接进入下轮循环
-            else:
-                for key, _ in self.sender.select(timeout=1):
-                    logging.debug(f'<- {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
-                    msg = packet.pack()
-                    try:
-                        key.fileobj.send(msg)
-                    except ConnectionResetError:
-                        self.remove(key.fileobj)
-                    break
-                else:
-                    # 若超时未取到就绪的 sock，则将 packet 放回队列首位，重入循环
-                    self.send_q.queue.insert(0, packet)
+            for key, _ in self.sender.select():
+                try:
+                    packet = self.send_q.get(timeout=0.1)
+                except Empty:
+                    continue
 
-    def recv(self):
+                try:
+                    # 发送数据
+                    msg = packet.pack()
+                    key.fileobj.send(msg)
+                except ConnectionResetError:
+                    self.remove(key.fileobj)
+                    # 若发送失败，则将 packet 放回队列首位，重入循环
+                    self.send_q.queue.insert(0, packet)
+                    logging.error(f'<-x {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                else:
+                    logging.debug(f'<- {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+
+    def _recv(self):
         '''接收并解析数据包, 解析结果存入 recv_q 队列'''
         while self.is_working:
             for key, _ in self.receiver.select(timeout=1):
                 sock, buf = key.fileobj, key.data
                 try:
-                    data = sock.recv(buf.remain)
+                    data = sock.recv(buf.remain, MSG_WAITALL)
                 except ConnectionResetError:
                     self.remove(sock)  # 关闭连接
                     break
@@ -241,7 +253,7 @@ class ConnectionPool:
                 else:
                     self.remove(sock)  # 关闭连接
 
-    def launch(self):
+    def start(self):
         s_thread = Thread(target=self.send, daemon=True)
         s_thread.start()
         self.threads.append(s_thread)
@@ -250,7 +262,7 @@ class ConnectionPool:
         r_thread.start()
         self.threads.append(r_thread)
 
-    def close_all(self):
+    def stop(self):
         '''关闭所有连接'''
         logging.info('[ConnectionPool] closing all connections')
         self.is_working = False
@@ -265,15 +277,7 @@ class ConnectionPool:
 
 
 class NetworkMixin:
-    def connect(self, server_addr: Tuple[str, int]):
-        '''建立连接'''
-        self.sock = create_connection(server_addr, timeout=30)
-
-    def recv_all(self, length: int) -> bytearray:
-        '''接收指定长度的完整数据'''
-        buffer = bytearray(length)
-        self.sock.recv_into(buffer, length, MSG_WAITALL)
-        return buffer
+    sock: socket
 
     def send_msg(self, flag: Flag, *args):
         '''发送数据报文'''
@@ -285,7 +289,7 @@ class NetworkMixin:
     def recv_msg(self) -> Packet:
         '''接收数据报文'''
         # 接收并解析 head 部分
-        head = self.recv_all(LEN_HEAD)
+        head = self.sock.recv(LEN_HEAD, MSG_WAITALL)
         flag, chksum, len_body = Packet.unpack_head(head)
         logging.debug(f'-> {flag} len={len_body}')
 
@@ -293,7 +297,7 @@ class NetworkMixin:
             raise ValueError('unknow flag: %d' % flag)
 
         # 接收 body 部分
-        body = self.recv_all(len_body)
+        body = self.sock.recv(len_body, MSG_WAITALL)
 
         # 错误重传
         if crc32(body) != chksum:

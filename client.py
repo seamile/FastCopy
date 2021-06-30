@@ -32,7 +32,8 @@ class Client(NetworkMixin):
     def handshake(self, remote_path: Union[str, list]):
         '''握手'''
         print('connect to %s:%s' % self.addr)
-        self.connect(self.addr)
+        self.sock = create_connection(self.addr, timeout=30)
+
         self.send_msg(self.action, remote_path)
         packet = self.recv_msg()
         self.sid, = packet.unpack_body()
