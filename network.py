@@ -2,12 +2,12 @@ import logging
 from binascii import crc32
 from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from socket import socket, MSG_WAITALL
+from socket import socket, timeout, MSG_WAITALL
 from struct import pack, unpack
 from threading import Thread
-from typing import Any, Dict, List, NamedTuple, Set, Tuple
+from typing import Any, List, NamedTuple, Set, Tuple
 
-from const import EOF, PacketSnippet, Flag, LEN_HEAD
+from const import EOF, Flag, LEN_HEAD
 
 
 class Packet(NamedTuple):
@@ -113,39 +113,12 @@ class Packet(NamedTuple):
         return self.chksum == chksum
 
 
-class Buffer:
-    __slots__ = ('waiting', 'remain', 'flag', 'chksum', 'data')
-
-    def __init__(self,
-                 waiting: PacketSnippet = PacketSnippet.HEAD,
-                 remain: int = LEN_HEAD) -> None:
-        self.waiting = waiting
-        self.remain = remain
-        self.flag: Any = None
-        self.chksum: int = 0
-        self.data: bytearray = bytearray()
-
-    def reset(self):
-        self.waiting = PacketSnippet.HEAD
-        self.remain = LEN_HEAD
-        self.flag = None
-        self.chksum = 0
-        self.data.clear()
-
-
-class Cookie:
-    def __init__(self) -> None:
-        self.head = bytearray()
-        self.body = bytearray()
-        self.sent: Dict[bytes, bytes] = {}  # 已发送的包
-
-
 class ConnectionPool:
-    max_size = 128
-    timeout = 0.001  # 1ms
+    _max_size = 128
+    _timeout = 0.001  # 1ms
 
     def __init__(self, size: int) -> None:
-        self.size = min(size, self.max_size)
+        self.size = min(size, self._max_size)
         # 发送、接收队列
         self.send_q: Queue[Packet] = Queue(self.size * 5)
         self.recv_q: Queue[Packet] = Queue(self.size * 5)
@@ -171,9 +144,9 @@ class ConnectionPool:
     def add(self, sock: socket):
         '''添加 sock'''
         if len(self.socks) < self.size:
-            self.sender.register(sock, EVENT_WRITE)
-            self.receiver.register(sock, EVENT_READ, Buffer())
             self.socks.add(sock)
+            self.sender.register(sock, EVENT_WRITE)
+            self.receiver.register(sock, EVENT_READ, bytearray())
             return True
         else:
             return False
@@ -185,36 +158,12 @@ class ConnectionPool:
         self.socks.remove(sock)
         sock.close()
 
-    def parse_head(self, buf: Buffer):
-        '''解析 head'''
-        # 解包
-        buf.flag, buf.chksum, buf.remain = Packet.unpack_head(buf.data)
-
-        # 切换 Buffer 为等待接收 body 状态
-        buf.waiting = PacketSnippet.BODY
-        buf.data.clear()
-
-    def parse_body(self, buf: Buffer):
-        '''解析 body'''
-        pkt = Packet(buf.flag, bytes(buf.data))
-        # 检查校验码
-        if pkt.is_valid(buf.chksum):
-            logging.debug(f'-> {pkt.flag.name}: length={pkt.length} chksum={pkt.chksum}')
-            self.recv_q.put(pkt)  # 正确的数据包放入队列
-        else:
-            logging.error('丢弃错误包，请求重传')
-            resend_pkt = Packet.load(Flag.RESEND, buf.flag, buf.chksum, pkt.length)
-            self.send_q.put(resend_pkt)
-
-        # 一个数据包解析完成后，重置 buf
-        buf.reset()
-
     def _send(self):
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
             for key, _ in self.sender.select():
                 try:
-                    packet = self.send_q.get(timeout=0.1)
+                    packet = self.send_q.get(timeout=0.2)
                 except Empty:
                     continue
 
@@ -222,38 +171,51 @@ class ConnectionPool:
                     # 发送数据
                     msg = packet.pack()
                     key.fileobj.send(msg)
-                except ConnectionResetError:
-                    self.remove(key.fileobj)
-                    # 若发送失败，则将 packet 放回队列首位，重入循环
-                    self.send_q.queue.insert(0, packet)
-                    logging.error(f'<-x {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
-                else:
-                    logging.debug(f'<- {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                    logging.debug(f'[Send] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                except Exception as e:
+                    # 若发送失败，则将 packet 放回队列首位
+                    self.send_q.queue.appendleft(packet)
+                    if isinstance(e, ConnectionResetError):
+                        # 对端已断开，则从本端删除此连接
+                        self.remove(key.fileobj)
+                    logging.error(f'SendErr: {e} | {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
 
     def _recv(self):
         '''接收并解析数据包, 解析结果存入 recv_q 队列'''
         while self.is_working:
-            for key, _ in self.receiver.select(timeout=1):
-                sock, buf = key.fileobj, key.data
+            for key, _ in self.receiver.select(timeout=0.2):
                 try:
-                    data = sock.recv(buf.remain, MSG_WAITALL)
-                except ConnectionResetError:
-                    self.remove(sock)  # 关闭连接
-                    break
+                    # 从缓存或 sock 取出包头
+                    head = key.data or key.fileobj.recv(LEN_HEAD, MSG_WAITALL)
+                except timeout:
+                    continue
 
-                if data:
-                    buf.remain -= len(data)  # 更新剩余长度
-                    buf.data.extend(data)  # 合并数据
+                # 若数据为空，关闭连接
+                if not head:
+                    self.remove(key.fileobj)
+                    continue
 
-                    if buf.remain == 0:
-                        if buf.waiting == PacketSnippet.HEAD:
-                            self.parse_head(buf)  # 解析 head 部分
-                        else:
-                            self.parse_body(buf)  # 解析 Body 部分
+                try:
+                    # 解析包头，并接收包体
+                    flag, chksum, length = Packet.unpack_head(head)
+                    body = key.fileobj.recv(length, MSG_WAITALL)
+                    key.data.clear()
+                except timeout:
+                    key.data.extend(head)
+                    continue
+
+                # 检查报文有效性
+                packet = Packet(flag, body)
+                if packet.is_valid(chksum):
+                    logging.debug(f'[Recv] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                    self.recv_q.put(packet)  # 正确的数据包放入队列
                 else:
-                    self.remove(sock)  # 关闭连接
+                    logging.error('丢弃错误包，请求重传')
+                    resend_packet = Packet.load(Flag.RESEND, flag, chksum, length)
+                    self.send_q.put(resend_packet)
 
     def start(self):
+        '''启动连接池的发送和接收线程'''
         s_thread = Thread(target=self.send, daemon=True)
         s_thread.start()
         self.threads.append(s_thread)
@@ -264,7 +226,6 @@ class ConnectionPool:
 
     def stop(self):
         '''关闭所有连接'''
-        logging.info('[ConnectionPool] closing all connections')
         self.is_working = False
         for t in self.threads:
             t.join()
@@ -274,6 +235,8 @@ class ConnectionPool:
 
         for sock in self.socks:
             sock.close()
+
+        logging.info('[ConnPool] closed all connections.')
 
 
 class NetworkMixin:
@@ -291,7 +254,7 @@ class NetworkMixin:
         # 接收并解析 head 部分
         head = self.sock.recv(LEN_HEAD, MSG_WAITALL)
         flag, chksum, len_body = Packet.unpack_head(head)
-        logging.debug(f'-> {flag} len={len_body}')
+        logging.debug(f'-> {flag}: length={len_body} {chksum=}')
 
         if not Flag.contains(flag):
             raise ValueError('unknow flag: %d' % flag)
