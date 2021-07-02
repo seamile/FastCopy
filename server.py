@@ -3,30 +3,15 @@
 import socket
 import logging
 from argparse import ArgumentParser, BooleanOptionalAction
-from functools import wraps
 from threading import Lock, Thread
 from typing import Dict
+from uuid import uuid4
 
 import daemon
 
 from const import Flag, SERVER_ADDR
 from network import NetworkMixin
 from transport import Sender, Receiver, Transporter
-
-
-def singleton(cls):
-    '''Singleton Pattern Decorator'''
-    obj = None
-
-    @wraps(cls)
-    def wrapper(*args, **kwargs):
-        nonlocal obj
-        if isinstance(obj, cls):
-            return obj
-        else:
-            obj = cls(*args, **kwargs)
-            return obj
-    return wrapper
 
 
 class WatchDog(Thread, NetworkMixin):
@@ -69,45 +54,31 @@ class WatchDog(Thread, NetworkMixin):
             self.sock.close()
 
 
-@singleton
 class Server(Thread):
-    def __init__(self, max_conn=256) -> None:
+    max_tasks = 256  # 同时运行的最大任务数量
+
+    def __init__(self, max_conn) -> None:
         super().__init__(daemon=True)
         self.addr = SERVER_ADDR
-        self.max_transporters = 65535  # 最大 Transporter 数量，与 Session ID 相关
         self.max_conn = max_conn  # 一个 Transporter 的最大连接数
         self.is_running = True
         self.mutex = Lock()
-        self.next_id = 1
-        self.transporters: Dict[int, Transporter] = {}
-
-    def geneate_sid(self) -> int:
-        with self.mutex:
-            if len(self.transporters) >= self.max_transporters:
-                raise ValueError('已达到最大 Transporter 数量，无法创建')
-
-            while self.next_id in self.transporters:
-                if self.next_id < self.max_transporters:
-                    self.next_id += 1
-                else:
-                    self.next_id = 1
-            else:
-                return self.next_id
+        self.transporters: Dict[bytes, Transporter] = {}
 
     def create_transporter(self, cli_flag: Flag, path: str) -> Transporter:
         '''创建新 Transporter'''
-        sid = self.geneate_sid()
+        sid = uuid4().bytes
         if cli_flag == Flag.PULL:
-            logging.info(f'[Server] New task-{sid} for send {path}')
+            logging.debug(f'[Server] New task-{sid.hex()} for send {path}')
             self.transporters[sid] = Sender(sid, path.split(','), self.max_conn)
         else:
-            logging.info(f'[Server] New task-{sid} for recv {path}')
+            logging.debug(f'[Server] New task-{sid.hex()} for recv {path}')
             self.transporters[sid] = Receiver(sid, path, self.max_conn)
         return self.transporters[sid]
 
     def close_all_transporters(self):
         '''关闭所有 Transporter'''
-        logging.info('[Server] Closing all transporters.')
+        logging.debug('[Server] Closing all transporters.')
         for transporter in self.transporters.values():
             transporter.close()
 
@@ -118,7 +89,7 @@ class Server(Thread):
             # wait for new connection
             logging.debug('[Server] Waitting for new connections')
             cli_sock, cli_addr = self.srv_sock.accept()
-            logging.debug('[Server] Accept new connection: %s:%s' % cli_addr)
+            logging.info('[Server] Accept new connection: %s:%s' % cli_addr)
 
             # create a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
@@ -128,11 +99,11 @@ class Server(Thread):
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=128,
-                        help='maximum concurrent connections')
+                        help='Max concurrent connections of one task')
     parser.add_argument('-d', dest='daemon', type=bool, action=BooleanOptionalAction,
-                        help='daemon mode')
+                        help='Daemon mode')
     parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
-                        help='verbose mode')
+                        help='Verbose mode')
 
     args = parser.parse_args()
     log_level = logging.DEBUG if args.verbose else logging.INFO

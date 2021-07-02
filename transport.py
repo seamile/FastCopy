@@ -7,7 +7,7 @@ from network import ConnectionPool
 
 
 class Sender(Thread):
-    def __init__(self, sid: int, src_paths: List[str], pool_size: int) -> None:
+    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int) -> None:
         super().__init__(daemon=True)
 
         self.sid = sid
@@ -15,17 +15,17 @@ class Sender(Thread):
         self.reader = Reader(src_paths, self.conn_pool.recv_q, self.conn_pool.send_q)
 
     def run(self):
-        logging.info(f'Sender({self.sid}) is running')
+        logging.debug(f'Sender-{self.sid.hex()} is running')
         self.conn_pool.start()  # 启动网络连接池
         self.reader.start()  # 启动读取线程
 
         self.reader.join()
         self.conn_pool.stop()
-        logging.info(f'Sender({self.sid}) exit')
+        logging.debug(f'Sender-{self.sid.hex()} exit')
 
 
 class Receiver(Thread):
-    def __init__(self, sid: int, dst_path: str, pool_size: int) -> None:
+    def __init__(self, sid: bytes, dst_path: str, pool_size: int) -> None:
         super().__init__(daemon=True)
 
         self.sid = sid
@@ -33,13 +33,13 @@ class Receiver(Thread):
         self.writer = Writer(dst_path, self.conn_pool.recv_q, self.conn_pool.send_q)
 
     def run(self):
-        logging.info(f'Receiver({self.sid}) is running')
+        logging.debug(f'Receiver-{self.sid.hex()} is running')
         self.conn_pool.start()  # 启动连接池
         self.writer.start()  # 启动写入线程
 
         self.writer.join()
         self.conn_pool.stop()
-        logging.info(f'Receiver({self.sid}) exit')
+        logging.debug(f'Receiver-{self.sid.hex()} exit')
 
 
 Transporter = Union[Sender, Receiver]

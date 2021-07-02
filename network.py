@@ -2,7 +2,9 @@ import logging
 from binascii import crc32
 from queue import Queue, Empty
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from socket import socket, timeout, MSG_WAITALL
+from socket import socket, MSG_WAITALL
+from socket import timeout as TimeoutError
+from socket import error as SocketError
 from struct import pack, unpack
 from threading import Thread
 from typing import Any, List, NamedTuple, Set, Tuple
@@ -34,20 +36,20 @@ class Packet(NamedTuple):
             else:
                 body = str(args[0]).encode('utf8')
         elif flag == Flag.SID or flag == Flag.ATTACH:
-            body = pack('>H', *args)
+            body = pack('>16s', *args)
         elif flag == Flag.FILE_COUNT:
-            body = pack('>H', *args)
+            body = pack('>I', *args)
         elif flag == Flag.DIR_INFO:
             length = len(args[-1])
-            body = pack(f'>2H{length}s', *args)
+            body = pack(f'>IH{length}s', *args)
         elif flag == Flag.FILE_INFO:
             length = len(args[-1])
-            body = pack(f'>2HQd16s{length}s', *args)
+            body = pack(f'>IHQd16s{length}s', *args)
         elif flag == Flag.FILE_READY:
-            body = pack('>H', *args)
+            body = pack('>I', *args)
         elif flag == Flag.FILE_CHUNK:
             length = len(args[-1])
-            body = pack(f'>HI{length}s', *args)
+            body = pack(f'>2I{length}s', *args)
         elif flag == Flag.DONE:
             body = pack('>I', EOF)
         elif flag == Flag.RESEND:
@@ -73,30 +75,30 @@ class Packet(NamedTuple):
             return (self.body.decode('utf-8'),)  # dest path
 
         elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
-            return unpack('>H', self.body)  # Worker ID
+            return unpack('>16s', self.body)  # Worker ID
 
         elif self.flag == Flag.FILE_COUNT:
-            return unpack('>H', self.body)  # file count
+            return unpack('>I', self.body)  # file count
 
         elif self.flag == Flag.DIR_INFO:
             # file_id | perm | path
-            #   2B    |  2B  |  ...
-            fmt = f'>2H{self.length - 4}s'
+            #   4B    |  2B  |  ...
+            fmt = f'>IH{self.length - 4}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_INFO:
             # file_id | perm | size | mtime | chksum | path
-            #   2B    |  2B  |  8B  |  8B   |  16B   |  ...
-            fmt = f'>2HQd16s{self.length - 36}s'
+            #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
+            fmt = f'>IHQd16s{self.length - 36}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_READY:
-            return unpack('>H', self.body)  # file id
+            return unpack('>I', self.body)  # file id
 
         elif self.flag == Flag.FILE_CHUNK:
             # file_id |  seq  | chunk
-            #    2B   |  4B   |  ...
-            fmt = f'>HI{self.length - 6}s'
+            #    4B   |  4B   |  ...
+            fmt = f'>2I{self.length - 6}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.DONE:
@@ -158,6 +160,12 @@ class ConnectionPool:
         self.socks.remove(sock)
         sock.close()
 
+    def handle_sock_err(self, error: SocketError, sock: socket):
+        '''处理 socket 错误'''
+        # 对端已断开，则从本端删除此连接
+        self.remove(sock)
+        logging.error(error)
+
     def _send(self):
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
@@ -171,13 +179,12 @@ class ConnectionPool:
                     # 发送数据
                     msg = packet.pack()
                     key.fileobj.send(msg)
-                    logging.debug(f'[Send] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                    logging.debug(f'[Send-{key.fd}] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                except SocketError as e:
+                    self.handle_sock_err(e, key.fileobj)
                 except Exception as e:
                     # 若发送失败，则将 packet 放回队列首位
                     self.send_q.queue.appendleft(packet)
-                    if isinstance(e, ConnectionResetError):
-                        # 对端已断开，则从本端删除此连接
-                        self.remove(key.fileobj)
                     logging.error(f'SendErr: {e} | {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
 
     def _recv(self):
@@ -187,7 +194,7 @@ class ConnectionPool:
                 try:
                     # 从缓存或 sock 取出包头
                     head = key.data or key.fileobj.recv(LEN_HEAD, MSG_WAITALL)
-                except timeout:
+                except TimeoutError:
                     continue
 
                 # 若数据为空，关闭连接
@@ -200,14 +207,14 @@ class ConnectionPool:
                     flag, chksum, length = Packet.unpack_head(head)
                     body = key.fileobj.recv(length, MSG_WAITALL)
                     key.data.clear()
-                except timeout:
+                except TimeoutError:
                     key.data.extend(head)
                     continue
 
                 # 检查报文有效性
                 packet = Packet(flag, body)
                 if packet.is_valid(chksum):
-                    logging.debug(f'[Recv] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
+                    logging.debug(f'[Recv-{key.fd}] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
                     self.recv_q.put(packet)  # 正确的数据包放入队列
                 else:
                     logging.error('丢弃错误包，请求重传')
@@ -216,11 +223,11 @@ class ConnectionPool:
 
     def start(self):
         '''启动连接池的发送和接收线程'''
-        s_thread = Thread(target=self.send, daemon=True)
+        s_thread = Thread(target=self._send, daemon=True)
         s_thread.start()
         self.threads.append(s_thread)
 
-        r_thread = Thread(target=self.recv, daemon=True)
+        r_thread = Thread(target=self._recv, daemon=True)
         r_thread.start()
         self.threads.append(r_thread)
 

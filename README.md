@@ -8,9 +8,9 @@
 
 ### 1. 报文统一格式
 
-| flag  | chksum | length | payload |
-| :---: | :----: | :----: | :-----: |
-|  1B   |   4B   |   2B   |   ...   |
+|  flag   | chksum  | length  | payload |
+| :-----: | :-----: | :-----: | :-----: |
+| 1 Bytes | 4 Bytes | 2 Bytes |   ...   |
 
 ### 2. 报文类型
 
@@ -47,7 +47,7 @@
 
         | session_id |
         | :--------: |
-        |     2B     |
+        |  16 Bytes  |
 
 3. 后续连接
 
@@ -58,19 +58,19 @@
 
         | session_id |
         | :--------: |
-        |     2B     |
+        |  16 Bytes  |
 
 4. 文件总量
 
     连接就绪后，发送端需告知接收端文件总量
 
-    - Payload 长度 2 字节，所以最大允许传输文件数量为 65535
+    - Payload 长度 4 字节，所以最大允许传输文件数量为 65535
     - 方向: Sender -> Receiver
     - Payload 格式:
 
         | n_files |
         | :-----: |
-        |   2B    |
+        | 4 Bytes |
 
 5. 文件信息
 
@@ -81,9 +81,9 @@
     - 方向: Sender -> Receiver
     - Payload 格式:
 
-        | file_id | perm  | size  | mtime | chksum | path  |
-        | :-----: | :---: | :---: | :---: | :----: | :---: |
-        |   2B    |  2B   |  8B   |  8B   |  16B   |  ...  |
+        | file_id |  perm   |  size   |  mtime  |  chksum  | path  |
+        | :-----: | :-----: | :-----: | :-----: | :------: | :---: |
+        | 4 Bytes | 2 Bytes | 8 Bytes | 8 Bytes | 16 Bytes |  ...  |
 
 6. 接收端文件准备就绪
 
@@ -94,16 +94,16 @@
 
         | file_id |
         | :-----: |
-        |   2B    |
+        | 4 Bytes |
 
 7. 文件数据块传输报文
 
     - 方向: Sender -> Receiver
     - Payload 格式:
 
-        | file_id |  seq  | data  |
-        | :-----: | :---: | :---: |
-        |   2B    |  4B   |  ...  |
+        | file_id |   seq   | data  |
+        | :-----: | :-----: | :---: |
+        | 4 Bytes | 4 Bytes |  ...  |
 
 8. 错误回传报文
 
@@ -111,9 +111,9 @@
 
     - Payload 格式:
 
-        |  seq  |
-        | :---: |
-        |  4B   |
+        |   seq   |
+        | :-----: |
+        | 4 Bytes |
 
 
 ## 0.2 版目标

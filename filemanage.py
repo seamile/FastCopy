@@ -452,7 +452,7 @@ class Writer(Thread):
             logging.info(f'[Writer] Total num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
-            logging.error('[Writer] The first packet must be `FILE_COUNT` but receive `{packet.flag.name}`')
+            logging.error(f'[Writer] The first packet must be `FILE_COUNT` but receive `{packet.flag.name}`')
             return
 
         # 等待接收文件信息和数据

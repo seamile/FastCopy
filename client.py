@@ -6,7 +6,7 @@ from os.path import abspath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter, BooleanOptionalAction
 from socket import socket, create_connection
 from textwrap import dedent
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from sshtunnel import open_tunnel
 
@@ -20,14 +20,15 @@ class Client(NetworkMixin):
         self.action = action
         self.srcs = srcs
         self.dst = dst
-        self.addr = addr
+
         self.user = ''
         self.sid = 0
         self.n_conn = n_conn
 
         # create by self.connect()
         self.sock: Optional[socket] = None  # type: ignore
-        self.transporter: Optional[Transporter] = None
+        self.transporter = None
+        self.tunnels: List = []
 
     def handshake(self, remote_path: Union[str, list]):
         '''握手'''
@@ -127,6 +128,7 @@ def main(parser: ArgumentParser):
                          ssh_private_key_password=None,
                          remote_bind_address=SERVER_ADDR,
                          compression=True)
+
     with tunnel:
         client = Client(action, srcs, dst, tunnel.local_bind_address, args.num)
 
@@ -157,8 +159,8 @@ if __name__ == '__main__':
     parser.add_argument('-P', dest='password', type=str, default=None,
                         help='Password for SSH')
 
-    parser.add_argument('-n', dest='num', type=int, default=16,
-                        help='Maximum number of connections (default: 16)')
+    parser.add_argument('-n', dest='num', type=int, default=8,
+                        help='Maximum number of connections (default: 8)')
 
     parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
                         help='Verbose mode')
