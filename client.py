@@ -16,7 +16,7 @@ from transport import Sender, Receiver, Transporter
 
 
 class Client(NetworkMixin):
-    def __init__(self, action: Flag, srcs: str, dst: str, addr: Tuple[str, int], n_conn: int):
+    def __init__(self, action: Flag, srcs: str, dst: str, n_conn: int):
         self.action = action
         self.srcs = srcs
         self.dst = dst
@@ -27,13 +27,13 @@ class Client(NetworkMixin):
 
         # create by self.connect()
         self.sock: Optional[socket] = None  # type: ignore
-        self.transporter = None
+        self.transporter: Optional[Transporter] = None
         self.tunnels: List = []
 
-    def handshake(self, remote_path: Union[str, list]):
+    def handshake(self, addr: Tuple[str, int], remote_path: Union[str, list]):
         '''握手'''
-        print('connect to %s:%s' % self.addr)
-        self.sock = create_connection(self.addr, timeout=30)
+        print('connect to %s:%s' % addr)
+        self.sock = create_connection(addr, timeout=30)
 
         self.send_msg(self.action, remote_path)
         packet = self.recv_msg()
@@ -120,17 +120,16 @@ def main(parser: ArgumentParser):
 
     tunnel = open_tunnel(host,
                          ssh_username=user,
-                         ssh_port=args.ssh_port,
-                         ssh_config_file='~/.ssh/config',
-                         ssh_host_key=None,
+                         ssh_port=args.port,
+                         ssh_config_file=args.ssh_config,
                          ssh_password=args.password,
-                         ssh_pkey=None,
+                         ssh_pkey=args.private_key,
                          ssh_private_key_password=None,
                          remote_bind_address=SERVER_ADDR,
                          compression=True)
 
     with tunnel:
-        client = Client(action, srcs, dst, tunnel.local_bind_address, args.num)
+        client = Client(action, srcs, dst, args.num)
 
         try:
             logging.info('[Client] Connecting to server')
@@ -148,22 +147,28 @@ if __name__ == '__main__':
         prog='fcp',
         formatter_class=RawDescriptionHelpFormatter,
         description=dedent('''
-            PULL : fcp [-p PORT] [USER@]HOST:SRC... DST
-            PUSH : fcp [-p PORT] SRC... [USER@]HOST:DST
+            PULL : fcp [OPTIONS...] [USER@]HOST:SRC... DST
+            PUSH : fcp [OPTIONS...] SRC... [USER@]HOST:DST
         ''')
     )
 
-    parser.add_argument('-p', dest='ssh_port', type=int, default=22,
-                        help='SSH server port (default: 22)')
+    parser.add_argument('-p', dest='port', type=int, default=22,
+                        help='The port of SSH server (default: 22)')
 
     parser.add_argument('-P', dest='password', type=str, default=None,
-                        help='Password for SSH')
+                        help='The password for SSH')
 
-    parser.add_argument('-n', dest='num', type=int, default=8,
-                        help='Maximum number of connections (default: 8)')
+    parser.add_argument('-i', dest='private_key', type=str, default=None,
+                        help='The private key file for SSH')
+
+    parser.add_argument('-F', dest='ssh_config', type=str, default='~/.ssh/config',
+                        help='The config file for SSH (default: ~/.ssh/config)')
+
+    parser.add_argument('-n', dest='num', type=int, default=16,
+                        help='Max number of connections (default: 16)')
 
     parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
-                        help='Verbose mode')
+                        help='Verbose mode (default: disable)')
 
     parser.add_argument(dest='srcs', nargs='+', help='source path')
     parser.add_argument(dest='dst', help='destination path')
