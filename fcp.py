@@ -18,11 +18,24 @@ from network import NetworkMixin, Packet
 from transport import Sender, Receiver, Transporter
 
 
+def _add_handler(logger, handler, loglevel=None):
+    """
+    Add a handler to an existing logging.Logger object
+    """
+    handler.setLevel(loglevel or logging.ERROR)
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(handler)
+
+
+sshtunnel._add_handler = _add_handler
+
+
 class ArgsError(Exception):
     pass
 
 
 class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
+    '''rewrite `SSHTunnelForwarder`'''
 
     def _raise(self, exception=sshtunnel.BaseSSHTunnelForwarderError, reason=None):
         self.logger.error(exception(reason))
@@ -34,7 +47,7 @@ class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
                           ssh_pkey_password=None,
                           allow_agent=True,
                           host_pkey_directories=None,
-                          logger=None):
+                          logger=logging.root):
         """
         Get sure authentication information is in place.
         ``ssh_pkey`` may be of classes:
@@ -42,28 +55,30 @@ class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
             key will be obtained from it
             - ``paramiko.Pkey`` - it will be transparently added to loaded keys
         """
-        ssh_loaded_pkeys = self.get_keys(
-            logger=logger,
-            host_pkey_directories=host_pkey_directories,
-            allow_agent=allow_agent
-        )
-
+        ssh_loaded_pkeys = []
         if isinstance(ssh_pkey, str):
             ssh_pkey_expanded = os.path.expanduser(ssh_pkey)
-            if os.path.exists(ssh_pkey_expanded):
+            if os.path.isfile(ssh_pkey_expanded):
                 ssh_pkey = self.read_private_key_file(
                     pkey_file=ssh_pkey_expanded,
                     pkey_password=ssh_pkey_password or ssh_password,
                     logger=logger
                 )
-            elif logger:
-                logger.warning('Private key file not found: {0}'
-                               .format(ssh_pkey))
-        if isinstance(ssh_pkey, paramiko.pkey.PKey):
-            ssh_loaded_pkeys.insert(0, ssh_pkey)
+                ssh_loaded_pkeys.append(ssh_pkey)
+            else:
+                logger.warning('Private key file not found: {0}'.format(ssh_pkey))
+
+        if not ssh_loaded_pkeys:
+            ssh_loaded_pkeys = self.get_keys(
+                logger=logger,
+                host_pkey_directories=host_pkey_directories,
+                allow_agent=allow_agent
+            )
 
         if not ssh_password and not ssh_loaded_pkeys:
-            ssh_password = getpass(f"{self.ssh_username}@{self.ssh_host}'s Password: ")
+            prompt = f"{self.ssh_username}@{self.ssh_host}'s Password: "
+            ssh_password = getpass(prompt)
+
         return (ssh_password, ssh_loaded_pkeys)
 
     def _connect_to_gateway(self):
@@ -87,10 +102,9 @@ class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
                 self.logger.debug('Authentication error')
                 self._stop_transport()
 
-        if self.ssh_password:
-            password = self.ssh_password
-        else:
-            password = getpass(f"{self.ssh_username}@{self.ssh_host}'s Password: ")
+        prompt = f"{self.ssh_username}@{self.ssh_host}'s Password: "
+        password = self.ssh_password or getpass(prompt)
+
         for _ in range(2):
             try:
                 self._transport = self._get_transport()
@@ -101,9 +115,8 @@ class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
                     return
             except paramiko.AuthenticationException:
                 self.logger.error('Permission denied, please try again.')
-                password = getpass(f"{self.ssh_username}@{self.ssh_host}'s Password: ")
-
-        self._stop_transport()
+                password = getpass(prompt)
+                self._stop_transport()
         self.logger.error('Permission denied (publickey,password).')
         sys.exit(1)
 
@@ -131,6 +144,103 @@ class SSHTunnelForwarder(sshtunnel.SSHTunnelForwarder):
                 msg = 'Problem setting SSH Forwarder up: {0}'.format(e.value)
                 self.logger.error(msg)
 
+    @classmethod
+    def get_keys(cls, logger=None, host_pkey_directories=None, allow_agent=False):
+        """
+        Load public keys from any available SSH agent or local
+        .ssh directory.
+
+        Arguments:
+            logger (Optional[logging.Logger])
+
+            host_pkey_directories (Optional[list[str]]):
+                List of local directories where host SSH pkeys in the format
+                "id_*" are searched. For example, ['~/.ssh']
+
+                .. versionadded:: 0.1.0
+
+            allow_agent (Optional[boolean]):
+                Whether or not load keys from agent
+
+                Default: False
+
+        Return:
+            list
+        """
+        keys = cls.get_agent_keys(logger=logger) if allow_agent else []
+
+        if host_pkey_directories is None:
+            host_pkey_directories = [sshtunnel.DEFAULT_SSH_DIRECTORY]
+
+        paramiko_key_types = {'rsa': paramiko.RSAKey,
+                              'dsa': paramiko.DSSKey,
+                              'ecdsa': paramiko.ECDSAKey}
+        if hasattr(paramiko, 'Ed25519Key'):
+            paramiko_key_types['ed25519'] = paramiko.Ed25519Key
+        for directory in host_pkey_directories:
+            for keytype in paramiko_key_types.keys():
+                ssh_pkey_expanded = os.path.expanduser(
+                    os.path.join(directory, 'id_{}'.format(keytype))
+                )
+                try:
+                    if os.path.isfile(ssh_pkey_expanded):
+                        ssh_pkey = cls.read_private_key_file(
+                            pkey_file=ssh_pkey_expanded,
+                            logger=logger,
+                            key_type=paramiko_key_types[keytype]
+                        )
+                        if ssh_pkey:
+                            keys.append(ssh_pkey)
+                except OSError as exc:
+                    if logger:
+                        logger.warning('Private key file {0} check error: {1}'
+                                       .format(ssh_pkey_expanded, exc))
+        if logger:
+            logger.info('{0} key(s) loaded'.format(len(keys)))
+        return keys
+
+    @classmethod
+    def read_private_key_file(cls,
+                              pkey_file,
+                              pkey_password=None,
+                              key_type=None,
+                              logger=None):
+        """
+        Get SSH Public key from a private key file, given an optional password
+
+        Arguments:
+            pkey_file (str):
+                File containing a private key (RSA, DSS or ECDSA)
+        Keyword Arguments:
+            pkey_password (Optional[str]):
+                Password to decrypt the private key
+            logger (Optional[logging.Logger])
+        Return:
+            paramiko.Pkey
+        """
+        ssh_pkey = None
+        key_types = (paramiko.RSAKey, paramiko.DSSKey, paramiko.ECDSAKey)
+        if hasattr(paramiko, 'Ed25519Key'):
+            key_types += (paramiko.Ed25519Key, )
+        for pkey_class in (key_type,) if key_type else key_types:
+            try:
+                ssh_pkey = pkey_class.from_private_key_file(
+                    pkey_file,
+                    password=pkey_password
+                )
+                break
+            except paramiko.PasswordRequiredException:
+                prompt = f"Enter passphrase for key '{pkey_file}': "
+                pkey_password = getpass(prompt)
+                return cls.read_private_key_file(pkey_file, pkey_password,
+                                                 key_type, logger)
+            except paramiko.SSHException:
+                if logger:
+                    logger.debug('Private key file ({0}) could not be loaded '
+                                 'as type {1} or bad password'
+                                 .format(pkey_file, pkey_class))
+        return ssh_pkey
+
 
 class Client(NetworkMixin):
     def __init__(self, action: Flag, srcs: str, dst: str, n_conn: int):
@@ -147,13 +257,12 @@ class Client(NetworkMixin):
         self.transporter: Optional[Transporter] = None
         self.tunnels: List = []
 
-    def connect(self, host, port=None, user=None, password=None, pkey=None, pkey_password=None,
+    def connect(self, host, port=None, user=None, pkey=None, pkey_password=None,
                 config_file=None):
         '''创建连接'''
         tunnel = SSHTunnelForwarder(host,
                                     ssh_port=port,
                                     ssh_username=user,
-                                    ssh_password=password,
                                     ssh_pkey=pkey,
                                     ssh_private_key_password=pkey_password,
                                     ssh_config_file=config_file,
