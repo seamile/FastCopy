@@ -10,11 +10,11 @@ from uuid import uuid4
 import daemon
 
 from const import Flag, SERVER_ADDR
-from network import NetworkMixin
+from network import Packet, send_msg, recv_msg
 from transport import Sender, Receiver, Transporter
 
 
-class WatchDog(Thread, NetworkMixin):
+class WatchDog(Thread):
     def __init__(self, server: 'Server', sock: socket.socket):
         super().__init__(daemon=True)
         self.server = server
@@ -24,8 +24,8 @@ class WatchDog(Thread, NetworkMixin):
         try:
             # 等待接收新连接的第一个数据报文
             logging.debug('waiting for the first packet from %s:%d' % self.sock.getpeername())
-            self.sock.settimeout(10)
-            packet = self.recv_msg()
+            self.sock.settimeout(30)
+            packet = recv_msg(self.sock)
             self.sock.settimeout(None)
         except socket.timeout:
             # 超时退出
@@ -41,7 +41,8 @@ class WatchDog(Thread, NetworkMixin):
             transporter.start()
 
             # 将 SID 发送给客户端
-            self.send_msg(Flag.SID, transporter.sid)
+            packet = Packet.load(Flag.SID, transporter.sid)
+            send_msg(self.sock, packet)
 
         elif packet.flag == Flag.ATTACH:
             sid, = packet.unpack_body()

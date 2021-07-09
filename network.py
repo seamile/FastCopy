@@ -1,13 +1,14 @@
 import logging
 from binascii import crc32
 from queue import Queue, Empty
+from paramiko import Channel
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from socket import socket, MSG_WAITALL
 from socket import timeout as TimeoutError
 from socket import error as SocketError
 from struct import pack, unpack
 from threading import Thread
-from typing import Any, List, NamedTuple, Set, Tuple
+from typing import Any, List, NamedTuple, Set, Tuple, Union
 
 from const import EOF, Flag, LEN_HEAD
 
@@ -115,6 +116,45 @@ class Packet(NamedTuple):
         return self.chksum == chksum
 
 
+def send_msg(sock: socket, packet: Packet):
+    '''发送数据报文'''
+    datagram = packet.pack()
+    sock.send(datagram)
+
+
+def recv_all(sock: Union[socket, Channel], length):
+    if isinstance(sock, socket):
+        return sock.recv(length, MSG_WAITALL)
+    else:
+        datagram = bytearray()
+        while length > 0:
+            _data = sock.recv(length)
+            length -= len(_data)
+            datagram.extend(_data)
+        return bytes(datagram)
+
+
+def recv_msg(sock: socket) -> Packet:
+    '''接收数据报文'''
+    # 接收并解析 head 部分
+    head = recv_all(sock, LEN_HEAD)
+    flag, chksum, len_body = Packet.unpack_head(head)
+
+    if not Flag.contains(flag):
+        raise ValueError('unknow flag: %d' % flag)
+
+    # 接收 body 部分
+    body = recv_all(sock, len_body)
+
+    # 错误重传
+    if crc32(body) != chksum:
+        pkt = Packet.load(Flag.RESEND, head)
+        send_msg(sock, pkt)
+        return recv_msg(sock)
+
+    return Packet(flag, body)
+
+
 class ConnectionPool:
     _max_size = 128
     _timeout = 0.001  # 1ms
@@ -177,8 +217,7 @@ class ConnectionPool:
 
                 try:
                     # 发送数据
-                    msg = packet.pack()
-                    key.fileobj.send(msg)
+                    send_msg(key.fileobj, packet)
                     logging.debug(f'[Send-{key.fd}] {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
                 except SocketError as e:
                     self.handle_sock_err(e, key.fileobj)
@@ -193,7 +232,7 @@ class ConnectionPool:
             for key, _ in self.receiver.select(timeout=0.2):
                 try:
                     # 从缓存或 sock 取出包头
-                    head = key.data or key.fileobj.recv(LEN_HEAD, MSG_WAITALL)
+                    head = key.data or recv_all(key.fileobj, LEN_HEAD)
                 except TimeoutError:
                     continue
 
@@ -205,7 +244,7 @@ class ConnectionPool:
                 try:
                     # 解析包头，并接收包体
                     flag, chksum, length = Packet.unpack_head(head)
-                    body = key.fileobj.recv(length, MSG_WAITALL)
+                    body = recv_all(key.fileobj, length)
                     key.data.clear()
                 except TimeoutError:
                     key.data.extend(head)
@@ -244,34 +283,3 @@ class ConnectionPool:
             sock.close()
 
         logging.info('[ConnPool] closed all connections.')
-
-
-class NetworkMixin:
-    sock: socket
-
-    def send_msg(self, flag: Flag, *args):
-        '''发送数据报文'''
-        packet = Packet.load(flag, *args)
-        datagram = packet.pack()
-        logging.debug('<- %r' % datagram)
-        self.sock.send(datagram)
-
-    def recv_msg(self) -> Packet:
-        '''接收数据报文'''
-        # 接收并解析 head 部分
-        head = self.sock.recv(LEN_HEAD, MSG_WAITALL)
-        flag, chksum, len_body = Packet.unpack_head(head)
-        logging.debug(f'-> {flag}: length={len_body} {chksum=}')
-
-        if not Flag.contains(flag):
-            raise ValueError('unknow flag: %d' % flag)
-
-        # 接收 body 部分
-        body = self.sock.recv(len_body, MSG_WAITALL)
-
-        # 错误重传
-        if crc32(body) != chksum:
-            self.send_msg(Flag.RESEND, head)
-            return self.recv_msg()
-
-        return Packet(flag, body)
