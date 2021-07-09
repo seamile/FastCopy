@@ -3,32 +3,17 @@
 import os
 import sys
 import logging
+from typing import List
 import paramiko
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
 from os.path import abspath
-from socket import socket, create_connection
+from socket import create_connection
 from textwrap import dedent
-from typing import List, Optional, Union
-from paramiko import pkey
-
-import sshtunnel
 
 from const import Flag, SERVER_ADDR
 from network import Packet, send_msg, recv_msg
-from transport import Sender, Receiver, Transporter
-
-
-def _add_handler(logger, handler, loglevel=None):
-    """
-    Add a handler to an existing logging.Logger object
-    """
-    handler.setLevel(loglevel or logging.ERROR)
-    handler.setFormatter(logging.Formatter('%(message)s'))
-    logger.addHandler(handler)
-
-
-sshtunnel._add_handler = _add_handler
+from transport import Sender, Receiver
 
 
 class ArgsError(Exception):
@@ -40,39 +25,44 @@ class Client:
     ssh_default_dir = os.path.expanduser('~/.ssh')
     ssh_config_file = os.path.join(ssh_default_dir, 'config')
 
-    def __init__(self, args_parser: ArgumentParser):
-        self.args_parser = args_parser
-        args = parser.parse_args()
-
-        (
-            self.action,
-            self.srcs,
-            self.dst,
-            self.user,
-            self.host
-        ) = self.parse_cli_args(args)
-        self.port = args.port
-        self.pkey = args.private_key
-        self.config = self.load_ssh_config(self.host, args.ssh_config)
-        self.max_channel = args.num
+    def __init__(self, cli_parser: ArgumentParser):
+        args = cli_parser.parse_args()
         self.set_log(args.verbose)
 
-        self.sid = 0
+        try:
+            # init instance attributes from CLI args:
+            #   - self.action:   Flag.PUSH | Flag.PULL
+            #   - self.host:     ssh server's ip or domain
+            #   - self.username: username used to login to the ssh server
+            #   - self.srcs:     source dirs or files
+            #   - self.dst:      dest dir or file
+            self.parse_cli_args(args)
+        except Exception as e:
+            logging.error(e)
+            cli_parser.print_help()
+            sys.exit(1)
 
-        # create by self.connect()
-        self.transporter: Optional[Transporter] = None
+        self.config = self.load_ssh_config(self.host, args.ssh_config)
+        self.max_channel = args.num
+        self.port = args.port
+        self.pkey_path = args.private_key
+        self.password = None
+        self.session_id = 0
+        self.transporter = None
         self.tunnels: List = []
 
-    def parse_remote_addr(self, remote):
+    @staticmethod
+    def parse_remote_addr(remote):
         '''解析远程主机登录信息'''
         netloc, path = remote.split(':')
         user, host = netloc.split('@') if '@' in netloc else ('', netloc)
         return user, host, path
 
-    def parse_remote_sources(self, sources):
+    @classmethod
+    def parse_remote_sources(cls, sources):
         users, hosts, srcs = set(), set(), set()
         for src in sources:
-            user, host, path = self.parse_remote_addr(src)
+            user, host, path = cls.parse_remote_addr(src)
             users.add(user)
             hosts.add(host)
             srcs.add(path)
@@ -84,14 +74,15 @@ class Client:
     def parse_cli_args(self, args):
         '''解析命令行参数'''
         if ':' in args.srcs[0]:
-            user, host, srcs = self.parse_remote_sources(args.srcs)
-            return Flag.PULL, srcs, args.dst, user, host
+            self.username, self.host, self.srcs = self.parse_remote_sources(args.srcs)
+            self.action = Flag.PULL
+            self.dst = args.dst
         elif ':' in args.dst:
-            user, host, dst = self.parse_remote_addr(args.dst)
-            return Flag.PUSH, args.srcs, dst, user, host
+            self.username, self.host, self.dst = self.parse_remote_addr(args.dst)
+            self.action = Flag.PUSH
+            self.srcs = args.srcs
         else:
-            self.args_parser.print_help()
-            sys.exit(1)
+            raise ValueError('Server address not specified.')
 
     def set_log(self, verbose_mode):
         '''处理日志'''
@@ -131,24 +122,29 @@ class Client:
                 except paramiko.SSHException:
                     continue
 
-    def create_transport(self, sock, user, pkey, password):
-        '''创建新的 ssh transport'''
+    def new_channel(self, sock, user, pkey, password):
+        '''create a new Channel'''
         try:
             tp = paramiko.Transport(sock)
+            tp.use_compression(True)
+            tp.set_keepalive(60)
             tp.connect(username=user, pkey=pkey, password=password)
-            return tp
+            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
+            self.tunnels.append((tp, channel))
+            return True
         except paramiko.SSHException:
             tp.stop_thread()
+            return False
 
-    def init_transport(self, host, port=None, username=None, pkey_path=None):
-        '''创建 ssh_transport'''
+    def init_channel(self):
+        '''创建 Channel'''
         # 获取 SSH 服务器的连接参数
-        host = self.config.get('hostname', host)
-        port = port or self.config.get('port') or self.ssh_default_port
-        username = username or self.config.get('user') or getuser()
+        self.host = self.config.get('hostname', self.host)
+        self.port = self.port or self.config.get('port') or self.ssh_default_port
+        self.username = self.username or self.config.get('user') or getuser()
 
         # search private keys
-        pkey_paths = [pkey_path] if pkey_path else self.config.get('identityfile', [])
+        pkey_paths = [self.pkey_path] if self.pkey_path else self.config.get('identityfile', [])
         if not pkey_paths:
             for filename in os.listdir(self.ssh_default_dir):
                 if filename.startswith('id_') and not filename.endswith('.pub'):
@@ -156,39 +152,37 @@ class Client:
                     pkey_paths.append(path)
 
         # connect to ssh server (just connect, not auth)
-        addr = (host, port)
-        sock = socket.create_connection(addr)
+        addr = (self.host, self.port)
+        sock = create_connection(addr)
 
         # try the pkeys one by one
         for _path in pkey_paths:
             key = self.load_key(_path)
-            if tp := self.create_transport(sock, username, key, None):
-                return tp
+            if self.new_channel(sock, self.username, key, None):
+                for _ in range(self.max_channel - 1):
+                    self.new_channel(sock, self.username, key, None)
 
         # try to auth with password
         for _ in range(3):
-            password = getpass(f'password for {username}@{host}: ')
-            if tp := self.create_transport(sock, username, None, password):
-                return tp
+            password = getpass(f'password for {self.username}@{self.host}: ')
+            if self.new_channel(sock, self.username, None, password):
+                for _ in range(self.max_channel - 1):
+                    self.new_channel(sock, self.username, None, password)
 
-    def handshake(self, channel, remote_path: Union[str, list]):
-        '''握手'''
-        packet = Packet.load(self.action, remote_path)
-        send_msg(channel, packet)
-        packet = recv_msg(channel)
-        self.sid, = packet.unpack_body()
+        logging.error('Failed to create SSH tunnel')
+        sys.exit(1)
 
     def init_conn(self):
         '''初始化连接'''
-        transport = self.init_transport(self.host, self.port, self.user)
+        channel = self.init_channel()
         if self.action == Flag.PULL:
             self.handshake(self.srcs)
-            self.transporter = Receiver(self.sid, abspath(self.dst), self.max_channel)
+            self.transporter = Receiver(self.session_id, abspath(self.dst), self.max_channel)
 
         elif self.action == Flag.PUSH:
             self.handshake(self.dst)
             srcs = [abspath(path) for path in self.srcs]
-            self.transporter = Sender(self.sid, srcs, self.max_channel)
+            self.transporter = Sender(self.session_id, srcs, self.max_channel)
 
         else:
             parser.print_help()
@@ -198,14 +192,14 @@ class Client:
 
     def create_parallel_connections(self):
         '''创建并行连接'''
-        attach_pkt = Packet.load(Flag.ATTACH, self.sid)
+        attach_pkt = Packet.load(Flag.ATTACH, self.session_id)
         datagram = attach_pkt.pack()
         for _ in range(self.max_channel - 1):
             sock = create_connection(self.addr)
             sock.send(datagram)
             self.transporter.conn_pool.add(sock)
 
-    def run(self, parser: ArgumentParser):
+    def start(self):
         '''主函数'''
         try:
             logging.info('[Client] Connecting to server')
@@ -246,7 +240,5 @@ if __name__ == '__main__':
     parser.add_argument(dest='srcs', nargs='+', help='source path')
     parser.add_argument(dest='dst', help='destination path')
 
-    args = parser.parse_args()
-    print(args.password)
-    # cli = Client.parse_args(parser)
-    # cli.run()
+    cli = Client(parser)
+    cli.start()
