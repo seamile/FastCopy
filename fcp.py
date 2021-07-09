@@ -3,13 +3,13 @@
 import os
 import sys
 import logging
-from typing import List
 import paramiko
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
 from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
+from typing import List
 
 from const import Flag, SERVER_ADDR
 from network import Packet, send_msg, recv_msg
@@ -46,9 +46,9 @@ class Client:
         self.max_channel = args.num
         self.port = args.port
         self.pkey_path = args.private_key
-        self.password = None
-        self.session_id = 0
-        self.transporter = None
+
+        # the ssh tunnels
+        # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
         self.tunnels: List = []
 
     @staticmethod
@@ -136,8 +136,8 @@ class Client:
             tp.stop_thread()
             return False
 
-    def init_channel(self):
-        '''创建 Channel'''
+    def connect(self):
+        '''连接服务器'''
         # 获取 SSH 服务器的连接参数
         self.host = self.config.get('hostname', self.host)
         self.port = self.port or self.config.get('port') or self.ssh_default_port
@@ -161,6 +161,7 @@ class Client:
             if self.new_channel(sock, self.username, key, None):
                 for _ in range(self.max_channel - 1):
                     self.new_channel(sock, self.username, key, None)
+                return
 
         # try to auth with password
         for _ in range(3):
@@ -168,45 +169,44 @@ class Client:
             if self.new_channel(sock, self.username, None, password):
                 for _ in range(self.max_channel - 1):
                     self.new_channel(sock, self.username, None, password)
+                return
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
 
-    def init_conn(self):
-        '''初始化连接'''
-        channel = self.init_channel()
-        if self.action == Flag.PULL:
-            self.handshake(self.srcs)
-            self.transporter = Receiver(self.session_id, abspath(self.dst), self.max_channel)
+    def handshake(self, remote_path: str):
+        '''握手'''
+        channel = self.tunnels[0][1]
+        conn_pkt = Packet.load(self.action, remote_path)
+        send_msg(channel, conn_pkt)
+        session_pkt = recv_msg(channel)
+        session_id, = session_pkt.unpack_body()
 
-        elif self.action == Flag.PUSH:
-            self.handshake(self.dst)
-            srcs = [abspath(path) for path in self.srcs]
-            self.transporter = Sender(self.session_id, srcs, self.max_channel)
+        attach_pkt = Packet.load(Flag.ATTACH, session_id)
+        for _, channel in self.tunnels:
+            send_msg(channel, attach_pkt)
 
-        else:
-            parser.print_help()
-            sys.exit(1)
-
-        self.transporter.conn_pool.add(self.sock)
-
-    def create_parallel_connections(self):
-        '''创建并行连接'''
-        attach_pkt = Packet.load(Flag.ATTACH, self.session_id)
-        datagram = attach_pkt.pack()
-        for _ in range(self.max_channel - 1):
-            sock = create_connection(self.addr)
-            sock.send(datagram)
-            self.transporter.conn_pool.add(sock)
+        return session_id
 
     def start(self):
         '''主函数'''
         try:
             logging.info('[Client] Connecting to server')
-            self.init_conn()
-            self.create_parallel_connections()
-            self.transporter.start()  # type:ignore
-            self.transporter.join()  # type:ignore
+            self.connect()
+
+            if self.action == Flag.PULL:
+                session_id = self.handshake(self.srcs)
+                transporter = Receiver(session_id, abspath(self.dst), self.max_channel)
+            else:
+                session_id = self.handshake(self.dst)
+                srcs = [abspath(path) for path in self.srcs]
+                transporter = Sender(session_id, srcs, self.max_channel)
+
+            for _, channel in self.tunnels:
+                transporter.conn_pool.add(channel)
+
+            transporter.start()
+            transporter.join()
         except Exception as e:
             logging.error(f'[Client] {e}, exit.')
             sys.exit(1)

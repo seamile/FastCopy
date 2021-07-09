@@ -24,7 +24,7 @@ class WatchDog(Thread):
         try:
             # 等待接收新连接的第一个数据报文
             logging.debug('waiting for the first packet from %s:%d' % self.sock.getpeername())
-            self.sock.settimeout(30)
+            self.sock.settimeout(60)
             packet = recv_msg(self.sock)
             self.sock.settimeout(None)
         except socket.timeout:
