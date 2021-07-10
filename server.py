@@ -11,7 +11,7 @@ import daemon
 
 from utils import Flag, SERVER_ADDR
 from utils import Packet, send_msg, recv_msg
-from utils import Sender, Receiver, Transporter
+from utils import Sender, Receiver, Porter
 
 
 class WatchDog(Thread):
@@ -34,14 +34,14 @@ class WatchDog(Thread):
             return
 
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
-            # 创建 Transporter
+            # 创建 Porter
             path, = packet.unpack_body()
-            transporter = self.server.create_transporter(packet.flag, path)
-            transporter.conn_pool.add(self.sock)
-            transporter.start()
+            porter = self.server.create_transporter(packet.flag, path)
+            porter.conn_pool.add(self.sock)
+            porter.start()
 
             # 将 SID 发送给客户端
-            packet = Packet.load(Flag.SID, transporter.sid)
+            packet = Packet.load(Flag.SID, porter.sid)
             send_msg(self.sock, packet)
 
         elif packet.flag == Flag.ATTACH:
@@ -61,13 +61,13 @@ class Server(Thread):
     def __init__(self, max_conn) -> None:
         super().__init__(daemon=True)
         self.addr = SERVER_ADDR
-        self.max_conn = max_conn  # 一个 Transporter 的最大连接数
+        self.max_conn = max_conn  # 一个 Porter 的最大连接数
         self.is_running = True
         self.mutex = Lock()
-        self.transporters: Dict[bytes, Transporter] = {}
+        self.transporters: Dict[bytes, Porter] = {}
 
-    def create_transporter(self, cli_flag: Flag, path: str) -> Transporter:
-        '''创建新 Transporter'''
+    def create_transporter(self, cli_flag: Flag, path: str) -> Porter:
+        '''创建新 Porter'''
         sid = uuid4().bytes
         if cli_flag == Flag.PULL:
             logging.debug(f'[Server] New task-{sid.hex()} for send {path}')
@@ -78,10 +78,10 @@ class Server(Thread):
         return self.transporters[sid]
 
     def close_all_transporters(self):
-        '''关闭所有 Transporter'''
+        '''关闭所有 Porter'''
         logging.debug('[Server] Closing all transporters.')
-        for transporter in self.transporters.values():
-            transporter.close()
+        for porter in self.transporters.values():
+            porter.close()
 
     def run(self):
         self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)

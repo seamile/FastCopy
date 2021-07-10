@@ -16,10 +16,6 @@ from utils import Packet, send_msg, recv_msg
 from utils import Sender, Receiver
 
 
-class ArgsError(Exception):
-    pass
-
-
 class Client:
     ssh_default_port = 22
     ssh_default_dir = os.path.expanduser('~/.ssh')
@@ -210,15 +206,15 @@ class Client:
 
             if self.action == Flag.PULL:
                 session_id = self.handshake(self.srcs)
-                transporter = Receiver(session_id, self.dst, self.max_channel)
+                porter = Receiver(session_id, self.dst, self.max_channel)
             else:
                 session_id = self.handshake(self.dst)
-                transporter = Sender(session_id, self.srcs, self.max_channel)
+                porter = Sender(session_id, self.srcs, self.max_channel)
 
-            transporter.start()
-            transporter.conn_pool.add(channel)
+            porter.start()
+            porter.conn_pool.add(channel)
             self.attched_connect(session_id, pkey, password, self.max_channel - 1)
-            transporter.join()
+            porter.join()
         except Exception as e:
             from traceback import print_exc
             logging.error(f'[Client] {e}, exit.')
