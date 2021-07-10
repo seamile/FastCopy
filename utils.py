@@ -2,18 +2,153 @@ import os
 import re
 import time
 import logging
+
+from binascii import crc32
 from collections import deque
+from enum import IntEnum
 from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
+from paramiko import Channel
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Semaphore
-from threading import Thread
-from typing import Deque, Dict, Generator, Iterable, List, Tuple, Union
+from queue import Queue, Empty
+from selectors import SelectSelector, EVENT_READ, EVENT_WRITE
+from socket import socket, MSG_WAITALL
+from socket import timeout as TimeoutError, error as SocketError
+from struct import pack, unpack
+from threading import Semaphore, Thread
+from typing import (Any, Deque, Dict, Generator, Iterable,
+                    List, NamedTuple, Set, Tuple, Union)
 
-from const import CHUNK_SIZE, EOF, Flag, TIMEOUT
-from network import Packet
+
+SERVER_ADDR = ('127.0.0.1', 7523)
+
+CHUNK_SIZE = 1400  # 默认数据块大小 (单位: 字节)
+TIMEOUT = 60 * 5  # 全局超时时间
+LEN_HEAD = 7
+
+EOF = 0xffffffff
+
+
+class Flag(IntEnum):
+    PUSH = 1        # 推送申请
+    PULL = 2        # 拉取申请
+    SID = 3         # 建立会话
+    ATTACH = 4      # 后续连接
+    FILE_COUNT = 5  # 文件总量
+    DIR_INFO = 6    # 文件信息
+    FILE_INFO = 7   # 文件信息
+    FILE_READY = 8  # 文件就绪
+    FILE_CHUNK = 9  # 数据传输
+    DONE = 10       # 完成
+    RESEND = 11     # 错误回传
+
+    @classmethod
+    def contains(cls, member: object) -> bool:
+        return member in cls.__members__.values()
+
+
+class Packet(NamedTuple):
+    flag: Flag
+    body: bytes
+
+    def __str__(self) -> str:
+        return f'Flag: {self.flag} Len={self.length}'
+
+    @property
+    def length(self) -> int:
+        return len(self.body)
+
+    @property
+    def chksum(self) -> int:
+        return crc32(self.body)
+
+    @staticmethod
+    def load(flag: Flag, *args) -> 'Packet':
+        '''将包体封包'''
+        if flag == Flag.PULL or flag == Flag.PUSH:
+            if isinstance(args[0], bytes):
+                body = args[0]
+            else:
+                body = str(args[0]).encode('utf8')
+        elif flag == Flag.SID or flag == Flag.ATTACH:
+            body = pack('>16s', *args)
+        elif flag == Flag.FILE_COUNT:
+            body = pack('>I', *args)
+        elif flag == Flag.DIR_INFO:
+            length = len(args[-1])
+            body = pack(f'>IH{length}s', *args)
+        elif flag == Flag.FILE_INFO:
+            length = len(args[-1])
+            body = pack(f'>IHQd16s{length}s', *args)
+        elif flag == Flag.FILE_READY:
+            body = pack('>I', *args)
+        elif flag == Flag.FILE_CHUNK:
+            length = len(args[-1])
+            body = pack(f'>2I{length}s', *args)
+        elif flag == Flag.DONE:
+            body = pack('>I', EOF)
+        elif flag == Flag.RESEND:
+            body = pack('>BIH', *args)
+        else:
+            raise ValueError('Invalid flag')
+        return Packet(flag, body)
+
+    def pack(self) -> bytes:
+        '''封包'''
+        fmt = f'>BIH{self.length}s'
+        return pack(fmt, self.flag, self.chksum, self.length, self.body)
+
+    @staticmethod
+    def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
+        '''解析 head'''
+        flag, chksum, length = unpack('>BIH', head)
+        return Flag(flag), chksum, length
+
+    def unpack_body(self) -> Tuple[Any, ...]:
+        '''将 body 解包'''
+        if self.flag == Flag.PULL or self.flag == Flag.PUSH:
+            return (self.body.decode('utf-8'),)  # dest path
+
+        elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
+            return unpack('>16s', self.body)  # Worker ID
+
+        elif self.flag == Flag.FILE_COUNT:
+            return unpack('>I', self.body)  # file count
+
+        elif self.flag == Flag.DIR_INFO:
+            # file_id | perm | path
+            #   4B    |  2B  |  ...
+            fmt = f'>IH{self.length - 6}s'
+            return unpack(fmt, self.body)
+
+        elif self.flag == Flag.FILE_INFO:
+            # file_id | perm | size | mtime | chksum | path
+            #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
+            fmt = f'>IHQd16s{self.length - 38}s'
+            return unpack(fmt, self.body)
+
+        elif self.flag == Flag.FILE_READY:
+            return unpack('>I', self.body)  # file id
+
+        elif self.flag == Flag.FILE_CHUNK:
+            # file_id |  seq  | chunk
+            #    4B   |  4B   |  ...
+            fmt = f'>2I{self.length - 8}s'
+            return unpack(fmt, self.body)
+
+        elif self.flag == Flag.DONE:
+            return unpack('>I', self.body)
+
+        elif self.flag == Flag.RESEND:
+            return unpack('>BIH', self.body)
+
+        else:
+            raise TypeError
+
+    def is_valid(self, chksum: int):
+        '''是否是有效的包体'''
+        return self.chksum == chksum
 
 
 class DirInfo:
@@ -32,7 +167,8 @@ class DirInfo:
         return self._values[index]
 
     def __str__(self) -> str:
-        return f'DirInfo(id={self.id}, perm={self.perm}, path={self.s_relpath})'
+        return (f'DirInfo(id={self.id}, perm={self.perm}, '
+                f'path={self.s_relpath})')
 
     @classmethod
     def load(cls, dir_id: int, fullpath: Path, relpath: Path):
@@ -61,9 +197,11 @@ class DirInfo:
 
 class FileInfo:
     '''文件基础信息'''
-    __slots__ = ('id', 'perm', 'size', 'mtime', 'chksum', 'relpath', 'abspath', '_values')
+    __slots__ = ('id', 'perm', 'size', 'mtime', 'chksum', 'relpath', 'abspath',
+                 '_values')
 
-    def __init__(self, id: int, perm: int, size: int, mtime: float, chksum: bytes, relpath: bytes):
+    def __init__(self, id: int, perm: int, size: int,
+                 mtime: float, chksum: bytes, relpath: bytes):
         self.id = id
         self.perm = perm
         self.size = size
@@ -74,11 +212,17 @@ class FileInfo:
 
     def __getitem__(self, index):
         if not hasattr(self, '_values'):
-            self._values = [self.id, self.perm, self.size, self.mtime, self.chksum, self.relpath]
+            self._values = [self.id,
+                            self.perm,
+                            self.size,
+                            self.mtime,
+                            self.chksum,
+                            self.relpath]
         return self._values[index]
 
     def __str__(self) -> str:
-        return f'FileInfo(id={self.id}, perm={self.perm:o}, sz={self.size}, path={self.s_relpath})'
+        return (f'FileInfo(id={self.id}, perm={self.perm:o}, '
+                f'sz={self.size}, path={self.s_relpath})')
 
     @property
     def n_chunks(self):
@@ -126,7 +270,8 @@ class FileInfo:
         '''封装文件数据块报文'''
         with open(self.abspath, 'rb') as fp:
             seq = 0
-            while chunk := fp.read(CHUNK_SIZE):  # 读取单位长度的数据，如果为空则跳出循环
+            # 读取单位长度的数据，如果为空则跳出循环
+            while chunk := fp.read(CHUNK_SIZE):
                 yield Packet.load(Flag.FILE_CHUNK, self.id, seq, chunk)
                 seq += 1
 
@@ -158,13 +303,17 @@ class FileInfo:
 
     def is_vaild(self):
         '''检查文件校验和'''
-        return self.abspath.is_file() and self.hash(self.abspath) == self.chksum
+        return (self.abspath.is_file()
+                and self.hash(self.abspath) == self.chksum)
 
 
 class Reader(Thread):
     '''文件读取器'''
 
-    def __init__(self, src_paths: List[str], input_q: Queue[Packet], output_q: Queue[Packet]):
+    def __init__(self,
+                 src_paths: List[str],
+                 input_q: Queue[Packet],
+                 output_q: Queue[Packet]):
         '''
         @src_path: 要读取的目标路径
         @input_q: 输入队列
@@ -300,7 +449,10 @@ class Reader(Thread):
 class Writer(Thread):
     '''文件写入线程'''
 
-    def __init__(self, dst_path: str, input_q: Queue[Packet], output_q: Queue[Packet]) -> None:
+    def __init__(self,
+                 dst_path: str,
+                 input_q: Queue[Packet],
+                 output_q: Queue[Packet]):
         '''
         @dst_path: 要读取的目标路径
         @input_q: 输入队列
@@ -327,14 +479,16 @@ class Writer(Thread):
         if self.total > 1:
             # 多文件传输
             self.base_dir = self.dst_path
-            self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)  # 确保保存目录存在
+            # 确保保存目录存在
+            self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
         elif self.total == 1:
             # 单文件传输
             if self.dst_path.is_dir():
                 self.base_dir = self.dst_path
             else:
                 self.base_dir = self.dst_path.parent
-                self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)  # 确保保存目录存在
+                # 确保保存目录存在
+                self.base_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
                 self.use_custom_name = True
 
     def process_dir_info(self, packet: Packet):
@@ -438,7 +592,7 @@ class Writer(Thread):
                 speed = f'{delta_size // 1024:6.1f} KB/s'
             else:
                 speed = f'{delta_size // 1048576:6.1f} MB/s'
-            logging.info(f'Progress: {current_size / self.size: 7.2%}  {speed}')
+            logging.info(f'Progress: {current_size / self.size: 7.2%} {speed}')
             self._last_time = now
             self._last_size = current_size
 
@@ -452,7 +606,8 @@ class Writer(Thread):
             logging.info(f'[Writer] Total num of files and dirs: {self.total}')
             self.check_dst_path()
         else:
-            logging.error(f'[Writer] The first packet must be `FILE_COUNT` but receive `{packet.flag.name}`')
+            logging.error(f'[Writer] The first packet must be `FILE_COUNT` '
+                          f'but receive `{packet.flag.name}`')
             return
 
         # 等待接收文件信息和数据
@@ -474,3 +629,221 @@ class Writer(Thread):
         else:
             self.output_q.put(Packet.load(Flag.DONE, EOF))
             logging.info('[Writer] All files finished')
+
+
+def send_msg(sock: socket, packet: Packet):
+    '''发送数据报文'''
+    datagram = packet.pack()
+    sock.send(datagram)
+
+
+def recv_all(sock: Union[socket, Channel], length):
+    if isinstance(sock, socket):
+        return sock.recv(length, MSG_WAITALL)
+    else:
+        datagram = bytearray()
+        while length > 0:
+            _data = sock.recv(length)
+            length -= len(_data)
+            datagram.extend(_data)
+        return bytes(datagram)
+
+
+def recv_msg(sock: socket) -> Packet:
+    '''接收数据报文'''
+    # 接收并解析 head 部分
+    head = recv_all(sock, LEN_HEAD)
+    flag, chksum, len_body = Packet.unpack_head(head)
+
+    if not Flag.contains(flag):
+        raise ValueError('unknow flag: %d' % flag)
+
+    # 接收 body 部分
+    body = recv_all(sock, len_body)
+
+    # 错误重传
+    if crc32(body) != chksum:
+        pkt = Packet.load(Flag.RESEND, head)
+        send_msg(sock, pkt)
+        return recv_msg(sock)
+
+    return Packet(flag, body)
+
+
+class ConnectionPool:
+    _max_size = 128
+    _timeout = 0.001  # 1ms
+
+    def __init__(self, size: int) -> None:
+        self.size = min(size, self._max_size)
+        # 发送、接收队列
+        self.send_q: Queue[Packet] = Queue(self.size * 5)
+        self.recv_q: Queue[Packet] = Queue(self.size * 5)
+
+        # 所有 Socket
+        self.socks: Set[socket] = set()
+
+        # 发送、接收多路复用
+        self.sender = SelectSelector()
+        self.receiver = SelectSelector()
+
+        self.is_working = True
+        self.threads: List[Thread] = []
+
+    def send(self, packet: Packet):
+        '''发送'''
+        self.send_q.put(packet)
+
+    def recv(self, block=True, timeout=None) -> Packet:
+        '''接收'''
+        return self.recv_q.get(block, timeout)
+
+    def add(self, sock: socket):
+        '''添加 sock'''
+        if len(self.socks) < self.size:
+            self.socks.add(sock)
+            self.sender.register(sock, EVENT_WRITE)
+            self.receiver.register(sock, EVENT_READ, bytearray())
+            return True
+        else:
+            return False
+
+    def remove(self, sock: socket):
+        '''删除 sock'''
+        self.sender.unregister(sock)
+        self.receiver.unregister(sock)
+        self.socks.remove(sock)
+        sock.close()
+
+    def handle_sock_err(self, error: SocketError, sock: socket):
+        '''处理 socket 错误'''
+        # 对端已断开，则从本端删除此连接
+        self.remove(sock)
+        logging.error(error)
+
+    def _send(self):
+        '''从 send_q 获取数据，并封包发送到对端'''
+        while self.is_working:
+            for key, _ in self.sender.select(1):
+                try:
+                    packet = self.send_q.get(timeout=1)
+                except Empty:
+                    break
+
+                try:
+                    # 发送数据
+                    send_msg(key.fileobj, packet)
+                    logging.debug(f'[Send-{key.fd}] {packet.flag.name}: '
+                                  f'length={packet.length} '
+                                  f'chksum={packet.chksum}')
+                except SocketError as e:
+                    self.handle_sock_err(e, key.fileobj)
+                except Exception as e:
+                    logging.error(f'SendErr: {e} | {packet.flag.name}: '
+                                  f'length={packet.length} '
+                                  f'chksum={packet.chksum}')
+                    # 若发送失败，则将 packet 放回队列首位
+                    self.send_q.queue.appendleft(packet)
+
+    def _recv(self):
+        '''接收并解析数据包, 解析结果存入 recv_q 队列'''
+        while self.is_working:
+            for key, _ in self.receiver.select(timeout=0.2):
+                try:
+                    # 从缓存或 sock 取出包头
+                    head = key.data or recv_all(key.fileobj, LEN_HEAD)
+                except TimeoutError:
+                    continue
+
+                # 若数据为空，关闭连接
+                if not head:
+                    self.remove(key.fileobj)
+                    continue
+
+                try:
+                    # 解析包头，并接收包体
+                    flag, chksum, length = Packet.unpack_head(head)
+                    body = recv_all(key.fileobj, length)
+                    key.data.clear()
+                except TimeoutError:
+                    key.data.extend(head)
+                    continue
+
+                # 检查报文有效性
+                packet = Packet(flag, body)
+                if packet.is_valid(chksum):
+                    logging.debug(f'[Recv-{key.fd}] {packet.flag.name}: '
+                                  f'length={packet.length} '
+                                  f'chksum={packet.chksum}')
+                    self.recv_q.put(packet)  # 正确的数据包放入队列
+                else:
+                    logging.error('丢弃错误包，请求重传')
+                    r_packet = Packet.load(Flag.RESEND, flag, chksum, length)
+                    self.send_q.put(r_packet)
+
+    def start(self):
+        '''启动连接池的发送和接收线程'''
+        s_thread = Thread(target=self._send, daemon=True)
+        s_thread.start()
+        self.threads.append(s_thread)
+
+        r_thread = Thread(target=self._recv, daemon=True)
+        r_thread.start()
+        self.threads.append(r_thread)
+
+    def stop(self):
+        '''关闭所有连接'''
+        self.is_working = False
+        for t in self.threads:
+            t.join()
+
+        self.sender.close()
+        self.receiver.close()
+
+        for sock in self.socks:
+            sock.close()
+
+        logging.info('[ConnPool] closed all connections.')
+
+
+class Sender(Thread):
+    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int):
+        super().__init__(daemon=True)
+
+        self.sid = sid
+        self.conn_pool = ConnectionPool(pool_size)
+        self.reader = Reader(src_paths,
+                             self.conn_pool.recv_q,
+                             self.conn_pool.send_q)
+
+    def run(self):
+        logging.debug(f'Sender-{self.sid.hex()} is running')
+        self.conn_pool.start()  # 启动网络连接池
+        self.reader.start()  # 启动读取线程
+
+        self.reader.join()
+        self.conn_pool.stop()
+        logging.debug(f'Sender-{self.sid.hex()} exit')
+
+
+class Receiver(Thread):
+    def __init__(self, sid: bytes, dst_path: str, pool_size: int) -> None:
+        super().__init__(daemon=True)
+
+        self.sid = sid
+        self.conn_pool = ConnectionPool(pool_size)
+        self.writer = Writer(dst_path,
+                             self.conn_pool.recv_q,
+                             self.conn_pool.send_q)
+
+    def run(self):
+        logging.debug(f'Receiver-{self.sid.hex()} is running')
+        self.conn_pool.start()  # 启动连接池
+        self.writer.start()  # 启动写入线程
+
+        self.writer.join()
+        self.conn_pool.stop()
+        logging.debug(f'Receiver-{self.sid.hex()} exit')
+
+
+Transporter = Union[Sender, Receiver]

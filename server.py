@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import daemon
 
-from const import Flag, SERVER_ADDR
-from network import Packet, send_msg, recv_msg
-from transport import Sender, Receiver, Transporter
+from utils import Flag, SERVER_ADDR
+from utils import Packet, send_msg, recv_msg
+from utils import Sender, Receiver, Transporter
 
 
 class WatchDog(Thread):

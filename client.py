@@ -11,9 +11,9 @@ from socket import create_connection
 from textwrap import dedent
 from typing import List
 
-from const import Flag, SERVER_ADDR
-from network import Packet, send_msg, recv_msg
-from transport import Sender, Receiver
+from utils import Flag, SERVER_ADDR
+from utils import Packet, send_msg, recv_msg
+from utils import Sender, Receiver
 
 
 class ArgsError(Exception):
