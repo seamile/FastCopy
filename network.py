@@ -2,7 +2,7 @@ import logging
 from binascii import crc32
 from queue import Queue, Empty
 from paramiko import Channel
-from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
+from selectors import SelectSelector, EVENT_READ, EVENT_WRITE
 from socket import socket, MSG_WAITALL
 from socket import timeout as TimeoutError
 from socket import error as SocketError
@@ -84,13 +84,13 @@ class Packet(NamedTuple):
         elif self.flag == Flag.DIR_INFO:
             # file_id | perm | path
             #   4B    |  2B  |  ...
-            fmt = f'>IH{self.length - 4}s'
+            fmt = f'>IH{self.length - 6}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_INFO:
             # file_id | perm | size | mtime | chksum | path
             #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
-            fmt = f'>IHQd16s{self.length - 36}s'
+            fmt = f'>IHQd16s{self.length - 38}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_READY:
@@ -99,7 +99,7 @@ class Packet(NamedTuple):
         elif self.flag == Flag.FILE_CHUNK:
             # file_id |  seq  | chunk
             #    4B   |  4B   |  ...
-            fmt = f'>2I{self.length - 6}s'
+            fmt = f'>2I{self.length - 8}s'
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.DONE:
@@ -169,8 +169,8 @@ class ConnectionPool:
         self.socks: Set[socket] = set()
 
         # 发送、接收多路复用
-        self.sender = DefaultSelector()
-        self.receiver = DefaultSelector()
+        self.sender = SelectSelector()
+        self.receiver = SelectSelector()
 
         self.is_working = True
         self.threads: List[Thread] = []
@@ -209,11 +209,11 @@ class ConnectionPool:
     def _send(self):
         '''从 send_q 获取数据，并封包发送到对端'''
         while self.is_working:
-            for key, _ in self.sender.select():
+            for key, _ in self.sender.select(1):
                 try:
-                    packet = self.send_q.get(timeout=0.2)
+                    packet = self.send_q.get(timeout=1)
                 except Empty:
-                    continue
+                    break
 
                 try:
                     # 发送数据
@@ -222,9 +222,9 @@ class ConnectionPool:
                 except SocketError as e:
                     self.handle_sock_err(e, key.fileobj)
                 except Exception as e:
+                    logging.error(f'SendErr: {e} | {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
                     # 若发送失败，则将 packet 放回队列首位
                     self.send_q.queue.appendleft(packet)
-                    logging.error(f'SendErr: {e} | {packet.flag.name}: length={packet.length} chksum={packet.chksum}')
 
     def _recv(self):
         '''接收并解析数据包, 解析结果存入 recv_q 队列'''

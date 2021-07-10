@@ -23,7 +23,7 @@ class WatchDog(Thread):
     def run(self):
         try:
             # 等待接收新连接的第一个数据报文
-            logging.debug('waiting for the first packet from %s:%d' % self.sock.getpeername())
+            logging.debug('[WatchDog] waiting for the first packet from %s:%d' % self.sock.getpeername())
             self.sock.settimeout(60)
             packet = recv_msg(self.sock)
             self.sock.settimeout(None)
@@ -88,7 +88,6 @@ class Server(Thread):
         logging.info('[Server] Listening to %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
-            logging.debug('[Server] Waitting for new connections')
             cli_sock, cli_addr = self.srv_sock.accept()
             logging.info('[Server] Accept new connection: %s:%s' % cli_addr)
 
