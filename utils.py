@@ -207,8 +207,8 @@ class ConnectionPool(Thread):
     def send(self, packet: Packet):
         self.send_q.put(packet)
 
-    def recv(self) -> Packet:
-        return self.recv_q.get()
+    def recv(self, timeout=TIMEOUT) -> Packet:
+        return self.recv_q.get(timeout)
 
     def _send(self, conn: socket):
         while not self.done.is_set():
@@ -410,24 +410,13 @@ class FileInfo:
                 and self.hash(self.abspath) == self.chksum)
 
 
-class Reader(Thread):
-    '''文件读取器'''
-
-    def __init__(self,
-                 src_paths: List[str],
-                 input_q: Queue[Packet],
-                 output_q: Queue[Packet]):
-        '''
-        @src_path: 要读取的目标路径
-        @input_q: 输入队列
-        @output_q: 输出队列
-        '''
+class Sender(Thread):
+    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int):
         super().__init__(daemon=True)
 
+        self.sid = sid
         self.src_paths = src_paths
-        self.input_q = input_q
-        self.output_q = output_q
-
+        self.conn_pool = ConnectionPool(pool_size)
         self.tree: Dict[int, Union[DirInfo, FileInfo]] = {}
 
     @staticmethod
@@ -451,14 +440,16 @@ class Reader(Thread):
             if item.is_file() or item.is_dir():
                 yield item
             else:
-                logging.debug(f'[Reader] The `{item}` is not a regular file or dir.')
+                logging.debug(f'[Sender] The `{item}` is not '
+                              f'a regular file or dir.')
 
     @staticmethod
     def need_exclude(path: Path, patterns: Iterable[str]) -> bool:
         if patterns:
             for pattern in patterns:
                 try:
-                    if path.match(pattern) or bool(re.search(pattern, path.as_posix())):
+                    if path.match(pattern) \
+                            or re.search(pattern, path.as_posix()):
                         return True
                 except re.error:
                     continue
@@ -479,9 +470,10 @@ class Reader(Thread):
                     if not cls.need_exclude(relpath, excludes):
                         yield sub_path, relpath
             else:
-                logging.error(f'[Reader] The {fullpath} is not a regular file or dir.')
+                logging.error(f'[Sender] The {fullpath} is not '
+                              f'a regular file or dir.')
         else:
-            logging.error(f'[Reader] No such file or directory: {fullpath}.')
+            logging.error(f'[Sender] No such file or directory: {fullpath}.')
 
     @classmethod
     def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
@@ -507,65 +499,63 @@ class Reader(Thread):
                     relpaths.add(relpath)
                     inf_cls = FileInfo if fullpath.is_file() else DirInfo
                     self.tree[_id] = inf_cls.load(_id, fullpath, relpath)
-                    logging.debug(f'[Reader] Found {inf_cls.__name__}: id={_id} path={relpath.as_posix()}')
+                    logging.debug(f'[Sender] Found {inf_cls.__name__}: '
+                                  f'id={_id} path={relpath.as_posix()}')
                     _id += 1
                 else:
-                    logging.debug(f'[Reader] Name conflict: {relpath.as_posix()}, ignore.')
+                    logging.debug(f'[Sender] Name conflict: '
+                                  f'{relpath.as_posix()}, ignore.')
 
         return _id  # _id == n_files + n_dirs
 
     def run(self):
+        logging.debug(f'Sender-{self.sid.hex()[:8]} is running')
+        self.conn_pool.start()  # 启动网络连接池
+
         # 整理所有文件
         total = self.prepare_all_files()
-        logging.info(f'[Reader] Num of files and dirs: {total}')
+        logging.info(f'[Sender] Num of files and dirs: {total}')
 
         # 将文件数量写入队列
         packet = Packet.load(Flag.FILE_COUNT, total)
-        self.output_q.put(packet)
+        self.conn_pool.send(packet)
 
         # 将目录树信息写入队列
         for _id in range(total):
             _info = self.tree[_id]
             flag = Flag.DIR_INFO if _info.abspath.is_dir() else Flag.FILE_INFO
             packet = Packet.load(flag, *_info)
-            self.output_q.put(packet)
+            self.conn_pool.send(packet)
 
         # 将对端准备就绪的文件读入 output_q
         while True:
             try:
-                packet = self.input_q.get(timeout=TIMEOUT)
+                packet = self.conn_pool.recv()
             except Empty:
-                logging.error('[Reader] get input queue timeout, reader exit.')
+                logging.error('[Sender] get input queue timeout, exit.')
                 break
             else:
                 if packet.flag == Flag.FILE_READY:
                     f_id, = packet.unpack_body()
                     for chunk_packet in self.tree[f_id].iread():
-                        self.output_q.put(chunk_packet)
+                        self.conn_pool.send(chunk_packet)
                 elif packet.flag == Flag.DONE:
-                    logging.info('[Reader] All files are processed, reader exit.')
+                    logging.info('[Sender] All files are processed, exit.')
                     break
                 else:
-                    logging.error(f'[Reader] Unknow packet: {packet}')
+                    logging.error(f'[Sender] Unknow packet: {packet}')
+
+        self.conn_pool.stop()
+        logging.debug(f'Sender-{self.sid.hex()[:8]} exit')
 
 
-class Writer(Thread):
-    '''文件写入线程'''
-
-    def __init__(self,
-                 dst_path: str,
-                 input_q: Queue[Packet],
-                 output_q: Queue[Packet]):
-        '''
-        @dst_path: 要读取的目标路径
-        @input_q: 输入队列
-        @output_q: 输出队列
-        '''
+class Receiver(Thread):
+    def __init__(self, sid: bytes, dst_path: str, pool_size: int) -> None:
         super().__init__(daemon=True)
 
-        self.dst_path = Reader.abspath(dst_path)
-        self.input_q = input_q
-        self.output_q = output_q
+        self.sid = sid
+        self.dst_path = Sender.abspath(dst_path)
+        self.conn_pool = ConnectionPool(pool_size)
 
         self.base_dir = Path.home()
         self.size = 0
@@ -600,7 +590,7 @@ class Writer(Thread):
         d_info = DirInfo(*packet.unpack_body())
         d_info.set_parent(self.base_dir)
         d_info.make()
-        logging.info(f'[Writer] Dir ready: {d_info}')
+        logging.info(f'[Receiver] Dir ready: {d_info}')
         # 接收数量 +1
         self.n_recv += 1
 
@@ -614,9 +604,9 @@ class Writer(Thread):
                 self.iwriters[f_id].send(None)
 
                 # 通知对端：文件准备就绪
-                logging.info(f'[Writer] File({f_id}) ready')
+                logging.info(f'[Receiver] File({f_id}) ready')
                 ready_pkt = Packet.load(Flag.FILE_READY, f_id)
-                self.output_q.put(ready_pkt)
+                self.conn_pool.send(ready_pkt)
                 self.ready_files.popleft()
             else:
                 break
@@ -634,7 +624,7 @@ class Writer(Thread):
         if f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.info(f'[Writer] File skiped: {f_info.s_relpath}.')
+            logging.info(f'[Receiver] File skiped: {f_info.s_relpath}.')
         else:
             if f_info.size > 0:
                 self.files[f_info.id] = f_info
@@ -645,7 +635,7 @@ class Writer(Thread):
                 # 传输的是空文件，直接标记为完成
                 f_info.touch()
                 self.n_recv += 1
-                logging.info(f'[Writer] File finished: {f_info.s_relpath}')
+                logging.info(f'[Receiver] File finished: {f_info.s_relpath}')
 
     def get_iwriter(self, f_id):
         '''获取写入迭代器'''
@@ -660,7 +650,8 @@ class Writer(Thread):
         '''处理文件数据块'''
         f_id, seq, chunk = packet.unpack_body()
         try:
-            logging.debug(f'[Writer] Write chunk({seq}) into {self.files[f_id].s_relpath}')
+            logging.debug(f'[Receiver] Write chunk({seq}) '
+                          f'into {self.files[f_id].s_relpath}')
             iwriter = self.get_iwriter(f_id)
             iwriter.send((seq, chunk))
         except StopIteration:
@@ -672,10 +663,12 @@ class Writer(Thread):
                 self.n_recv += 1
                 self.iwriters.pop(f_id)
                 self.ready_notice()
-                logging.info(f'[Writer] File finished: {self.files[f_id].s_relpath}')
+                logging.info(f'[Receiver] File finished: '
+                             f'{self.files[f_id].s_relpath}')
             else:
                 # TODO: 错误重传机制
-                logging.error(f'[Writer] Bad file hash: {self.files[f_id].s_relpath}')
+                logging.error(f'[Receiver] Bad file hash: '
+                              f'{self.files[f_id].s_relpath}')
 
         return len(chunk)
 
@@ -700,23 +693,27 @@ class Writer(Thread):
             self._last_size = current_size
 
     def run(self):
+        logging.debug(f'Receiver-{self.sid.hex()[:8]} is running')
+        self.conn_pool.start()  # 启动连接池
+
         # 等待接收文件总数数据包
-        logging.info('[Writer] Waitting for the total number of files')
-        packet = self.input_q.get()
+        logging.info('[Receiver] Waitting for the total number of files')
+        packet = self.conn_pool.recv()
         if packet.flag == Flag.FILE_COUNT:
             # 取出文件总数，并确认目标路径
             self.total, = packet.unpack_body()
-            logging.info(f'[Writer] Total num of files and dirs: {self.total}')
+            logging.info(f'[Receiver] Total num of files and dirs: '
+                         f'{self.total}')
             self.check_dst_path()
         else:
-            logging.error(f'[Writer] The first packet must be `FILE_COUNT` '
+            logging.error(f'[Receiver] The first packet must be `FILE_COUNT` '
                           f'but receive `{packet.flag.name}`')
             return
 
         # 等待接收文件信息和数据
         recv_size = 0
         while self.n_recv < self.total:
-            packet = self.input_q.get()
+            packet = self.conn_pool.recv()
             if packet.flag == Flag.DIR_INFO:
                 self.process_dir_info(packet)
 
@@ -728,50 +725,13 @@ class Writer(Thread):
                 self.print_progess(recv_size)
 
             else:
-                logging.error(f'[Writer] Unknow packet flag: {packet.flag}')
+                logging.error(f'[Receiver] Unknow packet flag: {packet.flag}')
         else:
-            self.output_q.put(Packet.load(Flag.DONE, EOF))
-            logging.info('[Writer] All files finished')
+            self.conn_pool.send(Packet.load(Flag.DONE, EOF))
+            logging.info('[Receiver] All files finished')
 
-
-class Sender(Thread):
-    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int):
-        super().__init__(daemon=True)
-
-        self.sid = sid
-        self.conn_pool = ConnectionPool(pool_size)
-        self.reader = Reader(src_paths,
-                             self.conn_pool.recv_q,
-                             self.conn_pool.send_q)
-
-    def run(self):
-        logging.debug(f'Sender-{self.sid.hex()} is running')
-        self.conn_pool.start()  # 启动网络连接池
-        self.reader.start()  # 启动读取线程
-
-        self.reader.join()
         self.conn_pool.stop()
-        logging.debug(f'Sender-{self.sid.hex()} exit')
-
-
-class Receiver(Thread):
-    def __init__(self, sid: bytes, dst_path: str, pool_size: int) -> None:
-        super().__init__(daemon=True)
-
-        self.sid = sid
-        self.conn_pool = ConnectionPool(pool_size)
-        self.writer = Writer(dst_path,
-                             self.conn_pool.recv_q,
-                             self.conn_pool.send_q)
-
-    def run(self):
-        logging.debug(f'Receiver-{self.sid.hex()} is running')
-        self.conn_pool.start()  # 启动连接池
-        self.writer.start()  # 启动写入线程
-
-        self.writer.join()
-        self.conn_pool.stop()
-        logging.debug(f'Receiver-{self.sid.hex()} exit')
+        logging.debug(f'Receiver-{self.sid.hex()[:8]} exit')
 
 
 Porter = Union[Sender, Receiver]

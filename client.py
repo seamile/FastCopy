@@ -39,7 +39,7 @@ class Client:
             sys.exit(1)
 
         self.config = self.load_ssh_config(self.host, args.ssh_config)
-        self.max_channel = args.num
+        self.n_channel = args.num
         self.port = args.port
         self.pkey_path = args.private_key
 
@@ -65,7 +65,8 @@ class Client:
         if len(users) == 1 and len(hosts) == 1:
             return users.pop(), hosts.pop(), ','.join(sorted(srcs))
         else:
-            raise ValueError('All source args must come from the same machine with same user.')
+            raise ValueError('All source args must come from '
+                             'the same machine with same user.')
 
     def parse_cli_args(self, args):
         '''解析命令行参数'''
@@ -131,11 +132,16 @@ class Client:
             tp.use_compression(True)
             tp.set_keepalive(60)
             tp.connect(username=user, pkey=pkey, password=password)
-            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
-            self.tunnels.append((tp, channel))
-            return channel
         except paramiko.SSHException:
             tp.stop_thread()
+            return
+
+        try:
+            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('dummy', 0))
+            self.tunnels.append((tp, channel))
+            return channel
+        except paramiko.ChannelException:
+            sys.exit(1)
 
     def first_connect(self):
         '''连接服务器'''
@@ -146,7 +152,11 @@ class Client:
         logging.debug(f'login info: {self.username}@{self.host}:{self.port}')
 
         # search private keys
-        pkey_paths = [self.pkey_path] if self.pkey_path else self.config.get('identityfile', [])
+        if self.pkey_path:
+            pkey_paths = [self.pkey_path]
+        else:
+            pkey_paths = self.config.get('identityfile', [])
+
         if not pkey_paths:
             for filename in os.listdir(self.ssh_default_dir):
                 if filename.startswith('id_') and not filename.endswith('.pub'):
@@ -206,14 +216,14 @@ class Client:
 
             if self.action == Flag.PULL:
                 session_id = self.handshake(self.srcs)
-                porter = Receiver(session_id, self.dst, self.max_channel)
+                porter = Receiver(session_id, self.dst, self.n_channel)
             else:
                 session_id = self.handshake(self.dst)
-                porter = Sender(session_id, self.srcs, self.max_channel)
+                porter = Sender(session_id, self.srcs, self.n_channel)
 
             porter.start()
             porter.conn_pool.add(channel)
-            # self.attched_connect(session_id, pkey, password, self.max_channel - 1)
+            self.attched_connect(session_id, pkey, password, self.n_channel - 1)
             porter.join()
         except Exception as e:
             from traceback import print_exc
@@ -242,7 +252,7 @@ if __name__ == '__main__':
                         help='The config file for SSH (default: ~/.ssh/config)')
 
     parser.add_argument('-n', dest='num', type=int, default=16,
-                        help='Max number of connections (default: 16)')
+                        help='Max number of connections (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
                         help='Verbose mode (default: disable)')

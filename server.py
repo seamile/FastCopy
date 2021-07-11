@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 
-import socket
 import logging
-from argparse import ArgumentParser, BooleanOptionalAction
+from argparse import ArgumentParser
+from socket import socket, create_server, timeout as TimeoutError
 from threading import Lock, Thread
 from typing import Dict
 from uuid import uuid4
@@ -15,7 +15,7 @@ from utils import Sender, Receiver, Porter
 
 
 class WatchDog(Thread):
-    def __init__(self, server: 'Server', sock: socket.socket):
+    def __init__(self, server: 'Server', sock: socket):
         super().__init__(daemon=True)
         self.server = server
         self.sock = sock
@@ -23,11 +23,12 @@ class WatchDog(Thread):
     def run(self):
         try:
             # 等待接收新连接的第一个数据报文
-            logging.debug('[WatchDog] waiting for the first packet from %s:%d' % self.sock.getpeername())
+            logging.debug('[WatchDog] waiting for handshake from %s:%d'
+                          % self.sock.getpeername())
             self.sock.settimeout(60)
             packet = recv_msg(self.sock)
             self.sock.settimeout(None)
-        except socket.timeout:
+        except TimeoutError:
             # 超时退出
             logging.debug('[WatchDog] handshake timeout, exit.')
             self.sock.close()
@@ -84,7 +85,7 @@ class Server(Thread):
             porter.close()
 
     def run(self):
-        self.srv_sock = socket.create_server(self.addr, backlog=2048, reuse_port=True)
+        self.srv_sock = create_server(self.addr, backlog=2048, reuse_port=True)
         logging.info('[Server] Listening to %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
@@ -98,25 +99,43 @@ class Server(Thread):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('-c', dest='concurrency', metavar='NUM', type=int, default=128,
-                        help='Max concurrent connections of one task')
-    parser.add_argument('-d', dest='daemon', type=bool, action=BooleanOptionalAction,
-                        help='Daemon mode')
-    parser.add_argument('-v', dest='verbose', type=bool, action=BooleanOptionalAction,
-                        help='Verbose mode')
+    parser.add_argument('-d',
+                        dest='daemon',
+                        action='store_true',
+                        help='daemonize the fcp process.')
+
+    parser.add_argument('-c',
+                        dest='concurrency',
+                        metavar='NUM',
+                        type=int,
+                        default=128,
+                        help='max concurrent connections of one task.')
+
+    parser.add_argument('--loglevel',
+                        metavar='LEVEL',
+                        default='error',
+                        choices=['debug', 'info', 'warning', 'error'],
+                        help=('specify the server verbosity level. '
+                              'Choices: debug | info | warning | error'))
 
     args = parser.parse_args()
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+
+    loglevel = getattr(logging, args.loglevel.upper())
+    logformat = '%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s'
+
     if args.daemon:
         with daemon.DaemonContext():
-            logging.basicConfig(filename='/tmp/fcpd.log', level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
-                                format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
+            logging.basicConfig(filename='/tmp/fcpd.log',
+                                level=loglevel,
+                                datefmt='%Y-%m-%d %H:%M:%S',
+                                format=logformat)
             server = Server(args.concurrency)
             server.start()
             server.join()
     else:
-        logging.basicConfig(level=log_level, datefmt='%Y-%m-%d %H:%M:%S',
-                            format='%(asctime)s %(levelname)7s %(module)s.%(lineno)s: %(message)s')
+        logging.basicConfig(level=loglevel,
+                            datefmt='%Y-%m-%d %H:%M:%S',
+                            format=logformat)
         server = Server(args.concurrency)
         server.start()
         server.join()

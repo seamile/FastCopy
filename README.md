@@ -121,8 +121,8 @@
 ## 0.3 版目标
 
 - [x] SSH Tunnel 支持
-- [ ] 合并: Sender + Writer, Receiver + Reader
-- [ ] 使用多线程改写 ConnectPool
+- [x] 合并: Sender + Writer, Receiver + Reader
+- [x] 使用多线程改写 ConnectPool
 - [ ] 完善的错误处理
 - [ ] Server 执行中的错误需要反馈到 Client
 - [ ] 服务器异常退出前，给客户端发送异常原因
