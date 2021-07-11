@@ -64,7 +64,7 @@
 
     连接就绪后，发送端需告知接收端文件总量
 
-    - Payload 长度 4 字节，所以最大允许传输文件数量为 65535
+    - Payload 长度 4 字节，所以最大允许传输文件数量为 4,294,967,296
     - 方向: Sender -> Receiver
     - Payload 格式:
 
@@ -97,6 +97,8 @@
         | 4 Bytes |
 
 7. 文件数据块传输报文
+
+    Chunk Sequence 占用 4 字节，所以支持的单个文件最大为: 4 GB * ChunkSize
 
     - 方向: Sender -> Receiver
     - Payload 格式:

@@ -213,7 +213,7 @@ class Client:
 
             porter.start()
             porter.conn_pool.add(channel)
-            self.attched_connect(session_id, pkey, password, self.max_channel - 1)
+            # self.attched_connect(session_id, pkey, password, self.max_channel - 1)
             porter.join()
         except Exception as e:
             from traceback import print_exc

@@ -12,17 +12,15 @@ from math import ceil
 from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
-from selectors import SelectSelector, EVENT_READ, EVENT_WRITE
 from socket import socket, MSG_WAITALL
-from socket import timeout as TimeoutError, error as SocketError
+# from socket import timeout as TimeoutError, error as SocketError
 from struct import pack, unpack
-from threading import Semaphore, Thread
-from typing import (Any, Deque, Dict, Generator, Iterable,
-                    List, NamedTuple, Set, Tuple, Union)
+from threading import Event, Semaphore, Thread
+from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
+                    Tuple, Union)
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-
 CHUNK_SIZE = 1400  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
@@ -151,179 +149,109 @@ class Packet(NamedTuple):
         return self.chksum == chksum
 
 
-def send_msg(sock: socket, packet: Packet):
+def send_msg(conn: Union[socket, Channel], packet: Packet):
     '''发送数据报文'''
     datagram = packet.pack()
-    sock.send(datagram)
+    conn.send(datagram)
 
 
-def recv_all(sock: Union[socket, Channel], length):
-    if isinstance(sock, socket):
-        return sock.recv(length, MSG_WAITALL)
+def recv_all(conn: Union[socket, Channel], length: int) -> bytes:
+    if isinstance(conn, socket):
+        return conn.recv(length, MSG_WAITALL)
     else:
         datagram = bytearray()
         while length > 0:
-            _data = sock.recv(length)
-            length -= len(_data)
-            datagram.extend(_data)
+            _data = conn.recv(length)
+            n_recv = len(_data)
+            if n_recv > 0:
+                length -= n_recv
+                datagram.extend(_data)
+            else:
+                break
         return bytes(datagram)
 
 
-def recv_msg(sock: socket) -> Packet:
+def recv_msg(conn: Union[socket, Channel]) -> Packet:
     '''接收数据报文'''
     # 接收并解析 head 部分
-    head = recv_all(sock, LEN_HEAD)
-    flag, chksum, len_body = Packet.unpack_head(head)
+    head = recv_all(conn, LEN_HEAD)
+    if len(head) == LEN_HEAD:
+        flag, chksum, len_body = Packet.unpack_head(head)
+    else:
+        raise ValueError
 
     if not Flag.contains(flag):
-        raise ValueError('unknow flag: %d' % flag)
+        raise ValueError
 
     # 接收 body 部分
-    body = recv_all(sock, len_body)
+    body = recv_all(conn, len_body)
 
     # 错误重传
-    if crc32(body) != chksum:
-        pkt = Packet.load(Flag.RESEND, head)
-        send_msg(sock, pkt)
-        return recv_msg(sock)
+    if len(body) != len_body or crc32(body) != chksum:
+        raise ValueError
 
     return Packet(flag, body)
 
 
-class ConnectionPool:
+class ConnectionPool(Thread):
     _max_size = 128
-    _timeout = 0.001  # 1ms
 
-    def __init__(self, size: int) -> None:
+    def __init__(self, size=16):
+        super().__init__(daemon=True)
         self.size = min(size, self._max_size)
-        # 发送、接收队列
-        self.send_q: Queue[Packet] = Queue(self.size * 5)
-        self.recv_q: Queue[Packet] = Queue(self.size * 5)
-
-        # 所有 Socket
-        self.socks: Set[socket] = set()
-
-        # 发送、接收多路复用
-        self.sender = SelectSelector()
-        self.receiver = SelectSelector()
-
-        self.is_working = True
-        self.threads: List[Thread] = []
+        self.send_q = Queue(size * 5)
+        self.recv_q = Queue(size * 5)
+        self.done = Event()
+        self.connections = {}
 
     def send(self, packet: Packet):
-        '''发送'''
         self.send_q.put(packet)
 
-    def recv(self, block=True, timeout=None) -> Packet:
-        '''接收'''
-        return self.recv_q.get(block, timeout)
+    def recv(self) -> Packet:
+        return self.recv_q.get()
 
-    def add(self, sock: socket):
-        '''添加 sock'''
-        if len(self.socks) < self.size:
-            self.socks.add(sock)
-            self.sender.register(sock, EVENT_WRITE)
-            self.receiver.register(sock, EVENT_READ, bytearray())
-            return True
-        else:
+    def _send(self, conn: socket):
+        while not self.done.is_set():
+            packet: Packet = self.send_q.get()
+            send_msg(conn, packet)
+
+    def _recv(self, conn: socket):
+        while not self.done.is_set():
+            try:
+                _timeout = conn.timeout  # type: ignore
+                conn.settimeout(5)
+                packet = recv_msg(conn)
+                conn.settimeout(_timeout)
+            except Exception as e:
+                print(e)
+                return
+            self.recv_q.put(packet)
+
+    def add(self, conn: socket):
+        '''添加一个连接'''
+        # 检查数量是否达到上限
+        if len(self.connections) >= self._max_size:
             return False
+        # 检查是否已添加过
+        if conn in self.connections:
+            return True
 
-    def remove(self, sock: socket):
-        '''删除 sock'''
-        self.sender.unregister(sock)
-        self.receiver.unregister(sock)
-        self.socks.remove(sock)
-        sock.close()
+        t_send = Thread(target=self._send, args=(conn,), daemon=True)
+        t_send.start()
 
-    def handle_sock_err(self, error: SocketError, sock: socket):
-        '''处理 socket 错误'''
-        # 对端已断开，则从本端删除此连接
-        self.remove(sock)
-        logging.error(error)
-
-    def _send(self):
-        '''从 send_q 获取数据，并封包发送到对端'''
-        while self.is_working:
-            for key, _ in self.sender.select(1):
-                try:
-                    packet = self.send_q.get(timeout=1)
-                except Empty:
-                    break
-
-                try:
-                    # 发送数据
-                    send_msg(key.fileobj, packet)
-                    logging.debug(f'[Send-{key.fd}] {packet.flag.name}: '
-                                  f'length={packet.length} '
-                                  f'chksum={packet.chksum}')
-                except SocketError as e:
-                    self.handle_sock_err(e, key.fileobj)
-                except Exception as e:
-                    logging.error(f'SendErr: {e} | {packet.flag.name}: '
-                                  f'length={packet.length} '
-                                  f'chksum={packet.chksum}')
-                    # 若发送失败，则将 packet 放回队列首位
-                    self.send_q.queue.appendleft(packet)
-
-    def _recv(self):
-        '''接收并解析数据包, 解析结果存入 recv_q 队列'''
-        while self.is_working:
-            for key, _ in self.receiver.select(timeout=0.2):
-                try:
-                    # 从缓存或 sock 取出包头
-                    head = key.data or recv_all(key.fileobj, LEN_HEAD)
-                except TimeoutError:
-                    continue
-
-                # 若数据为空，关闭连接
-                if not head:
-                    self.remove(key.fileobj)
-                    continue
-
-                try:
-                    # 解析包头，并接收包体
-                    flag, chksum, length = Packet.unpack_head(head)
-                    body = recv_all(key.fileobj, length)
-                    key.data.clear()
-                except TimeoutError:
-                    key.data.extend(head)
-                    continue
-
-                # 检查报文有效性
-                packet = Packet(flag, body)
-                if packet.is_valid(chksum):
-                    logging.debug(f'[Recv-{key.fd}] {packet.flag.name}: '
-                                  f'length={packet.length} '
-                                  f'chksum={packet.chksum}')
-                    self.recv_q.put(packet)  # 正确的数据包放入队列
-                else:
-                    logging.error('丢弃错误包，请求重传')
-                    r_packet = Packet.load(Flag.RESEND, flag, chksum, length)
-                    self.send_q.put(r_packet)
-
-    def start(self):
-        '''启动连接池的发送和接收线程'''
-        s_thread = Thread(target=self._send, daemon=True)
-        s_thread.start()
-        self.threads.append(s_thread)
-
-        r_thread = Thread(target=self._recv, daemon=True)
-        r_thread.start()
-        self.threads.append(r_thread)
+        t_recv = Thread(target=self._recv, args=(conn,), daemon=True)
+        t_recv.start()
+        return True
 
     def stop(self):
-        '''关闭所有连接'''
-        self.is_working = False
-        for t in self.threads:
-            t.join()
+        self.done.set()
+        for conn in self.connections:
+            conn.close()
 
-        self.sender.close()
-        self.receiver.close()
-
-        for sock in self.socks:
-            sock.close()
-
-        logging.info('[ConnPool] closed all connections.')
+    def run(self):
+        self.done.clear()
+        self.done.wait()
+        self.stop()
 
 
 class DirInfo:
