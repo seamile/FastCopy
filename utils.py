@@ -214,16 +214,18 @@ class ConnectionPool(Thread):
         while not self.done.is_set():
             packet: Packet = self.send_q.get()
             send_msg(conn, packet)
+            logging.debug(f'[Send] {packet.flag.name} '
+                          f'chk={packet.chksum:08x} '
+                          f'len={packet.length}')
 
     def _recv(self, conn: socket):
         while not self.done.is_set():
             try:
-                _timeout = conn.timeout  # type: ignore
-                conn.settimeout(5)
                 packet = recv_msg(conn)
-                conn.settimeout(_timeout)
-            except Exception as e:
-                print(e)
+                logging.debug(f'[Recv] {packet.flag.name} '
+                              f'chk={packet.chksum:08x} '
+                              f'len={packet.length}')
+            except Exception:
                 return
             self.recv_q.put(packet)
 
@@ -411,12 +413,15 @@ class FileInfo:
 
 
 class Sender(Thread):
-    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int):
+    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int,
+                 include=None, exclude=None):
         super().__init__(daemon=True)
 
         self.sid = sid
         self.src_paths = src_paths
         self.conn_pool = ConnectionPool(pool_size)
+        self.include = include or '*'
+        self.exclude = exclude or []
         self.tree: Dict[int, Union[DirInfo, FileInfo]] = {}
 
     @staticmethod
@@ -445,29 +450,27 @@ class Sender(Thread):
 
     @staticmethod
     def need_exclude(path: Path, patterns: Iterable[str]) -> bool:
-        if patterns:
-            for pattern in patterns:
-                try:
-                    if path.match(pattern) \
-                            or re.search(pattern, path.as_posix()):
-                        return True
-                except re.error:
-                    continue
+        for pattern in patterns:
+            try:
+                if path.match(pattern) or re.search(pattern, path.as_posix()):
+                    return True
+            except re.error:
+                continue
         return False
 
     @classmethod
-    def checkout_paths(cls, fullpath: Path, include: str, excludes: Iterable[str]) \
+    def checkout_paths(cls, fullpath: Path, include: str, exclude: Iterable[str]) \
             -> Generator[Tuple[Path, Path], None, None]:
         '''检出路径'''
         if fullpath.exists():
             if fullpath.is_file():
                 relpath = fullpath.relative_to(fullpath.parent)
-                if not cls.need_exclude(relpath, excludes):
+                if not cls.need_exclude(relpath, exclude):
                     yield fullpath, relpath
             elif fullpath.is_dir():
                 for sub_path in cls.traverse_directory(fullpath, include):
                     relpath = sub_path.relative_to(fullpath)
-                    if not cls.need_exclude(relpath, excludes):
+                    if not cls.need_exclude(relpath, exclude):
                         yield sub_path, relpath
             else:
                 logging.error(f'[Sender] The {fullpath} is not '
@@ -476,16 +479,17 @@ class Sender(Thread):
             logging.error(f'[Sender] No such file or directory: {fullpath}.')
 
     @classmethod
-    def search_files_and_dirs(cls, path: str, include='*', excludes=None) \
+    def search_files_and_dirs(cls, path: str, include: str, exclude: list) \
             -> Generator[Tuple[Path, Path], None, None]:
         '''查找文件与文件夹'''
         _path = cls.abspath(path)
         if has_magic(path):
             for matched_path in iglob(str(_path)):
-                for paths in cls.checkout_paths(Path(matched_path), include, excludes):
+                matched = Path(matched_path)
+                for paths in cls.checkout_paths(matched, include, exclude):
                     yield paths
         else:
-            for paths in cls.checkout_paths(_path, include, excludes):
+            for paths in cls.checkout_paths(_path, include, exclude):
                 yield paths
 
     def prepare_all_files(self):
@@ -493,7 +497,7 @@ class Sender(Thread):
         _id = 0
         relpaths = set()
         for src_path in self.src_paths:
-            items = self.search_files_and_dirs(src_path)
+            items = self.search_files_and_dirs(src_path, self.include, self.exclude)
             for fullpath, relpath in items:
                 if relpath not in relpaths:
                     relpaths.add(relpath)

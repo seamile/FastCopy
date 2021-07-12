@@ -6,12 +6,15 @@ import logging
 import paramiko
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
+from json import dumps
 from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
+from threading import Thread
+from time import sleep
 from typing import List
 
-from utils import Flag, SERVER_ADDR
+from utils import Flag, SERVER_ADDR, TIMEOUT
 from utils import Packet, send_msg, recv_msg
 from utils import Sender, Receiver
 
@@ -42,6 +45,8 @@ class Client:
         self.n_channel = args.num
         self.port = args.port
         self.pkey_path = args.private_key
+        self.include = args.include
+        self.exclude = args.exclude.split(',')
 
         # the ssh tunnels
         # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
@@ -63,7 +68,7 @@ class Client:
             hosts.add(host)
             srcs.add(path)
         if len(users) == 1 and len(hosts) == 1:
-            return users.pop(), hosts.pop(), ','.join(sorted(srcs))
+            return users.pop(), hosts.pop(), sorted(srcs)
         else:
             raise ValueError('All source args must come from '
                              'the same machine with same user.')
@@ -91,6 +96,8 @@ class Client:
         }.get(verbose_mode, logging.ERROR)
 
         logging.basicConfig(level=log_level, format='%(message)s')
+        paramiko_logger = logging.getLogger("paramiko")
+        paramiko_logger.setLevel(logging.ERROR)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
@@ -125,6 +132,13 @@ class Client:
                 except paramiko.SSHException:
                     continue
 
+    def new_channel_name(self):
+        '''产生一个新的 Channel 名'''
+        if not hasattr(self, '_chanid'):
+            self._chanid = 0
+        self._chanid += 1
+        return f'{self._chanid:03d}'
+
     def new_channel(self, sock, user, pkey, password):
         '''create a new Channel'''
         try:
@@ -137,8 +151,10 @@ class Client:
             return
 
         try:
-            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('dummy', 0))
+            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
+            channel.settimeout(TIMEOUT)
             self.tunnels.append((tp, channel))
+            channel.set_name(self.new_channel_name())
             return channel
         except paramiko.ChannelException:
             sys.exit(1)
@@ -193,20 +209,24 @@ class Client:
         send_msg(channel, conn_pkt)
         session_pkt = recv_msg(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'Channel {channel.chanid} connected')
+        logging.info(f'[Client] Channel {channel.get_name()} connected')
 
         return session_id
 
-    def attched_connect(self, session_id, pkey, password, num):
+    def attched_connect(self, session_id, pkey, password):
         '''后续连接'''
         addr = (self.host, self.port)
         attach_pkt = Packet.load(Flag.ATTACH, session_id)
 
-        for _ in range(num):
+        def _connect(wait):
+            sleep(wait)
             sock = create_connection(addr)
             channel = self.new_channel(sock, self.username, pkey, password)
             send_msg(channel, attach_pkt)
-            logging.debug(f'Channel {channel.chanid} connected')
+            logging.info(f'[Client] Channel {channel.get_name()} connected')
+
+        for i in range(self.n_channel - 1):
+            Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
 
     def start(self):
         '''主函数'''
@@ -215,15 +235,21 @@ class Client:
             channel, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
-                session_id = self.handshake(self.srcs)
+                remote_path = dumps({
+                    'srcs': self.srcs,
+                    'include': self.include,
+                    'exclude': self.exclude
+                }, ensure_ascii=False, separators=(',', ':'))
+                session_id = self.handshake(remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
             else:
                 session_id = self.handshake(self.dst)
-                porter = Sender(session_id, self.srcs, self.n_channel)
+                porter = Sender(session_id, self.srcs, self.n_channel,
+                                self.include, self.exclude)
 
             porter.start()
             porter.conn_pool.add(channel)
-            self.attched_connect(session_id, pkey, password, self.n_channel - 1)
+            self.attched_connect(session_id, pkey, password)
             porter.join()
         except Exception as e:
             from traceback import print_exc
@@ -256,6 +282,12 @@ if __name__ == '__main__':
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
                         help='Verbose mode (default: disable)')
+
+    parser.add_argument('--include', type=str, metavar='PATTERN', default='*',
+                        help='include files matching PATTERN')
+
+    parser.add_argument('--exclude', type=str, metavar='PATTERN', default='',
+                        help='exclude files matching PATTERN, split by `,`')
 
     parser.add_argument(dest='srcs', nargs='+', help='source path')
     parser.add_argument(dest='dst', help='destination path')

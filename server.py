@@ -2,6 +2,7 @@
 
 import logging
 from argparse import ArgumentParser
+from json import loads
 from socket import socket, create_server, timeout as TimeoutError
 from threading import Lock, Thread
 from typing import Dict
@@ -71,8 +72,13 @@ class Server(Thread):
         '''创建新 Porter'''
         sid = uuid4().bytes
         if cli_flag == Flag.PULL:
+            _path = loads(path)
+            srcs = _path['srcs']
+            include = _path['include']
+            exclude = _path['exclude']
             logging.debug(f'[Server] New task-{sid.hex()} for send {path}')
-            self.transporters[sid] = Sender(sid, path.split(','), self.max_conn)
+            self.transporters[sid] = Sender(sid, srcs, self.max_conn,
+                                            include, exclude)
         else:
             logging.debug(f'[Server] New task-{sid.hex()} for recv {path}')
             self.transporters[sid] = Receiver(sid, path, self.max_conn)
