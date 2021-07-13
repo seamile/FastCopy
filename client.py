@@ -46,7 +46,7 @@ class Client:
         self.port = args.port
         self.pkey_path = args.private_key
         self.include = args.include
-        self.exclude = args.exclude.split(',')
+        self.exclude = [p for p in args.exclude.split(',') if p]
 
         # the ssh tunnels
         # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
