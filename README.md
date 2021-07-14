@@ -124,7 +124,7 @@
 - [x] 合并: Sender + Writer, Receiver + Reader
 - [x] 使用多线程改写 ConnectPool
 - [x] 完善的错误处理
-- [ ] include / exclude 支持
+- [x] include / exclude 支持
 - [ ] Server 执行中的错误需要反馈到 Client
 - [ ] 服务器异常退出前，给客户端发送异常原因
 

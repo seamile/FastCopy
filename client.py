@@ -20,9 +20,9 @@ from utils import Sender, Receiver
 
 
 class Client:
-    ssh_default_port = 22
-    ssh_default_dir = os.path.expanduser('~/.ssh')
-    ssh_config_file = os.path.join(ssh_default_dir, 'config')
+    default_port = 22
+    default_dir = os.path.expanduser('~/.ssh')
+    default_config = os.path.join(default_dir, 'config')
 
     def __init__(self, cli_parser: ArgumentParser):
         args = cli_parser.parse_args()
@@ -102,12 +102,12 @@ class Client:
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
         '''加载默认配置'''
-        _path = user_config_file or cls.ssh_config_file
+        _path = user_config_file or cls.default_config
         cfg = paramiko.SSHConfig.from_path(_path)
         return cfg.lookup(hostname)
 
     @staticmethod
-    def load_key(key_path):
+    def load_pkey(key_path):
         '''加载 Key'''
         _path = os.path.abspath(os.path.expanduser(key_path))
         if not os.path.isfile(_path):
@@ -131,6 +131,23 @@ class Client:
                     password = getpass(f"Enter password for key '{key_path}': ")
                 except paramiko.SSHException:
                     continue
+
+    def search_pkeys(self):
+        '''查找可用的私钥'''
+        if self.pkey_path:
+            pkey_paths = [self.pkey_path]
+        else:
+            pkey_paths = self.config.get('identityfile', [])
+
+        if not pkey_paths:
+            for keyname in os.listdir(self.default_dir):
+                if keyname.startswith('id_') and not keyname.endswith('.pub'):
+                    path = os.path.join(self.default_dir, keyname)
+                    pkey_paths.append(path)
+
+        logging.debug(f'found pkeys: {pkey_paths}')
+
+        return pkey_paths
 
     def new_channel_name(self):
         '''产生一个新的 Channel 名'''
@@ -166,22 +183,12 @@ class Client:
         '''连接服务器'''
         # 获取 SSH 服务器的连接参数
         self.host = self.config.get('hostname', self.host)
-        self.port = self.port or self.config.get('port') or self.ssh_default_port
+        self.port = self.port or self.config.get('port') or self.default_port
         self.username = self.username or self.config.get('user') or getuser()
         logging.debug(f'login info: {self.username}@{self.host}:{self.port}')
 
         # search private keys
-        if self.pkey_path:
-            pkey_paths = [self.pkey_path]
-        else:
-            pkey_paths = self.config.get('identityfile', [])
-
-        if not pkey_paths:
-            for filename in os.listdir(self.ssh_default_dir):
-                if filename.startswith('id_') and not filename.endswith('.pub'):
-                    path = os.path.join(self.ssh_default_dir, filename)
-                    pkey_paths.append(path)
-        logging.debug(f'found pkeys: {pkey_paths}')
+        pkey_paths = self.search_pkeys()
 
         # connect to ssh server (just connect, not auth)
         addr = (self.host, self.port)
@@ -190,7 +197,7 @@ class Client:
         # try the pkeys one by one
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
-            pkey = self.load_key(_path)
+            pkey = self.load_pkey(_path)
             channels = self.new_channel(sock, self.username, pkey, None)
             if channels:
                 return channels[0], pkey, None
