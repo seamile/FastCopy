@@ -6,18 +6,17 @@ import logging
 import paramiko
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
+from json import dumps
 from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
+from threading import Thread
+from time import sleep
 from typing import List
 
-from utils import Flag, SERVER_ADDR
+from utils import Flag, SERVER_ADDR, TIMEOUT
 from utils import Packet, send_msg, recv_msg
 from utils import Sender, Receiver
-
-
-class ArgsError(Exception):
-    pass
 
 
 class Client:
@@ -43,9 +42,11 @@ class Client:
             sys.exit(1)
 
         self.config = self.load_ssh_config(self.host, args.ssh_config)
-        self.max_channel = args.num
+        self.n_channel = args.num
         self.port = args.port
         self.pkey_path = args.private_key
+        self.include = args.include
+        self.exclude = [p for p in args.exclude.split(',') if p]
 
         # the ssh tunnels
         # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
@@ -67,9 +68,10 @@ class Client:
             hosts.add(host)
             srcs.add(path)
         if len(users) == 1 and len(hosts) == 1:
-            return users.pop(), hosts.pop(), ','.join(sorted(srcs))
+            return users.pop(), hosts.pop(), sorted(srcs)
         else:
-            raise ValueError('All source args must come from the same machine with same user.')
+            raise ValueError('All source args must come from '
+                             'the same machine with same user.')
 
     def parse_cli_args(self, args):
         '''解析命令行参数'''
@@ -94,6 +96,8 @@ class Client:
         }.get(verbose_mode, logging.ERROR)
 
         logging.basicConfig(level=log_level, format='%(message)s')
+        paramiko_logger = logging.getLogger("paramiko")
+        paramiko_logger.setLevel(logging.ERROR)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
@@ -128,18 +132,35 @@ class Client:
                 except paramiko.SSHException:
                     continue
 
-    def new_channel(self, sock, user, pkey, password):
+    def new_channel_name(self):
+        '''产生一个新的 Channel 名'''
+        if not hasattr(self, '_chanid'):
+            self._chanid = 0
+        self._chanid += 1
+        return f'{self._chanid:03d}'
+
+    def new_channel(self, sock, user, pkey, password, num=1):
         '''create a new Channel'''
         try:
             tp = paramiko.Transport(sock)
             tp.use_compression(True)
             tp.set_keepalive(60)
             tp.connect(username=user, pkey=pkey, password=password)
-            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
-            self.tunnels.append((tp, channel))
-            return channel
         except paramiko.SSHException:
             tp.stop_thread()
+            return
+
+        try:
+            conns = [tp]
+            for _ in range(num):
+                channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
+                channel.settimeout(TIMEOUT)
+                channel.set_name(self.new_channel_name())
+                conns.append(channel)
+            self.tunnels.append(conns)
+            return conns[1:]
+        except paramiko.ChannelException:
+            sys.exit(1)
 
     def first_connect(self):
         '''连接服务器'''
@@ -150,7 +171,11 @@ class Client:
         logging.debug(f'login info: {self.username}@{self.host}:{self.port}')
 
         # search private keys
-        pkey_paths = [self.pkey_path] if self.pkey_path else self.config.get('identityfile', [])
+        if self.pkey_path:
+            pkey_paths = [self.pkey_path]
+        else:
+            pkey_paths = self.config.get('identityfile', [])
+
         if not pkey_paths:
             for filename in os.listdir(self.ssh_default_dir):
                 if filename.startswith('id_') and not filename.endswith('.pub'):
@@ -166,59 +191,72 @@ class Client:
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
             pkey = self.load_key(_path)
-            channel = self.new_channel(sock, self.username, pkey, None)
-            if channel is not None:
-                return channel, pkey, None
+            channels = self.new_channel(sock, self.username, pkey, None)
+            if channels:
+                return channels[0], pkey, None
 
         # try to auth with password
         for _ in range(3):
             password = getpass(f'password for {self.username}@{self.host}: ')
-            channel = self.new_channel(sock, self.username, None, password)
-            if channel is not None:
-                return channel, None, password
+            channels = self.new_channel(sock, self.username, None, password)
+            if channels:
+                return channels[0], None, password
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
 
     def handshake(self, remote_path: str):
         '''握手'''
+        logging.info('[Client] Handshaking...')
         channel = self.tunnels[0][1]
         conn_pkt = Packet.load(self.action, remote_path)
         send_msg(channel, conn_pkt)
         session_pkt = recv_msg(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'Channel {channel.chanid} connected')
+        logging.info(f'[Client] Channel {channel.get_name()} connected')
 
         return session_id
 
-    def attched_connect(self, session_id, pkey, password, num):
+    def attched_connect(self, porter, session_id, pkey, password):
         '''后续连接'''
         addr = (self.host, self.port)
         attach_pkt = Packet.load(Flag.ATTACH, session_id)
 
-        for _ in range(num):
+        def _connect(wait):
+            sleep(wait)
             sock = create_connection(addr)
-            channel = self.new_channel(sock, self.username, pkey, password)
-            send_msg(channel, attach_pkt)
-            logging.debug(f'Channel {channel.chanid} connected')
+            channels = self.new_channel(sock, self.username, pkey, password, 3)
+            for channel in channels:
+                send_msg(channel, attach_pkt)
+                porter.conn_pool.add(channel)
+                logging.info(f'[Client] Channel {channel.get_name()} connected')
+
+        for i in range(self.n_channel - 1):
+            Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
 
     def start(self):
         '''主函数'''
         try:
-            logging.info('[Client] Connecting to server')
+            logging.info('[Client] Connecting to server...')
             channel, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
-                session_id = self.handshake(self.srcs)
-                transporter = Receiver(session_id, self.dst, self.max_channel)
+                remote_path = dumps({
+                    'srcs': self.srcs,
+                    'include': self.include,
+                    'exclude': self.exclude
+                }, ensure_ascii=False, separators=(',', ':'))
+                session_id = self.handshake(remote_path)
+                porter = Receiver(session_id, self.dst, self.n_channel)
             else:
                 session_id = self.handshake(self.dst)
-                transporter = Sender(session_id, self.srcs, self.max_channel)
+                porter = Sender(session_id, self.srcs, self.n_channel,
+                                self.include, self.exclude)
 
-            transporter.start()
-            transporter.conn_pool.add(channel)
-            self.attched_connect(session_id, pkey, password, self.max_channel - 1)
-            transporter.join()
+            porter.start()
+            porter.conn_pool.add(channel)
+            self.attched_connect(porter, session_id, pkey, password)
+            porter.join()
         except Exception as e:
             from traceback import print_exc
             logging.error(f'[Client] {e}, exit.')
@@ -246,10 +284,16 @@ if __name__ == '__main__':
                         help='The config file for SSH (default: ~/.ssh/config)')
 
     parser.add_argument('-n', dest='num', type=int, default=16,
-                        help='Max number of connections (default: 16)')
+                        help='Max number of connections (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
                         help='Verbose mode (default: disable)')
+
+    parser.add_argument('--include', type=str, metavar='PATTERN', default='*',
+                        help='include files matching PATTERN')
+
+    parser.add_argument('--exclude', type=str, metavar='PATTERN', default='',
+                        help='exclude files matching PATTERN, split by `,`')
 
     parser.add_argument(dest='srcs', nargs='+', help='source path')
     parser.add_argument(dest='dst', help='destination path')

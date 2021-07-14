@@ -64,7 +64,7 @@
 
     连接就绪后，发送端需告知接收端文件总量
 
-    - Payload 长度 4 字节，所以最大允许传输文件数量为 65535
+    - Payload 长度 4 字节，所以最大允许传输文件数量为 4,294,967,296
     - 方向: Sender -> Receiver
     - Payload 格式:
 
@@ -98,6 +98,8 @@
 
 7. 文件数据块传输报文
 
+    Chunk Sequence 占用 4 字节，所以支持的单个文件最大为: 4 GB * ChunkSize
+
     - 方向: Sender -> Receiver
     - Payload 格式:
 
@@ -116,19 +118,13 @@
         | 4 Bytes |
 
 
-## 0.2 版目标
-
-- [x] 文件路径通配符解析
-- [x] 文件查找时“包含”与“不包含”参数过滤
-- [x] 多个源路径支持
-- [x] 增加传输进度的打印
-- [x] 已存在且未修改的文件跳过
-- [ ] 优化调试信息打印
-
 ## 0.3 版目标
 
-- [ ] SSH Tunnel 支持
-- [ ] 完善的错误处理
+- [x] SSH Tunnel 支持
+- [x] 合并: Sender + Writer, Receiver + Reader
+- [x] 使用多线程改写 ConnectPool
+- [x] 完善的错误处理
+- [ ] include / exclude 支持
 - [ ] Server 执行中的错误需要反馈到 Client
 - [ ] 服务器异常退出前，给客户端发送异常原因
 
