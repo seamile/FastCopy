@@ -38,7 +38,7 @@ class WatchDog(Thread):
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
             # 创建 Porter
             path, = packet.unpack_body()
-            porter = self.server.create_transporter(packet.flag, path)
+            porter = self.server.create_porter(packet.flag, path)
             porter.conn_pool.add(self.sock)
             porter.start()
 
@@ -48,7 +48,7 @@ class WatchDog(Thread):
 
         elif packet.flag == Flag.ATTACH:
             sid, = packet.unpack_body()
-            if not self.server.transporters[sid].conn_pool.add(self.sock):
+            if not self.server.porters[sid].conn_pool.add(self.sock):
                 self.sock.close()
 
         else:
@@ -66,9 +66,9 @@ class Server(Thread):
         self.max_conn = max_conn  # 一个 Porter 的最大连接数
         self.is_running = True
         self.mutex = Lock()
-        self.transporters: Dict[bytes, Porter] = {}
+        self.porters: Dict[bytes, Porter] = {}
 
-    def create_transporter(self, cli_flag: Flag, path: str) -> Porter:
+    def create_porter(self, cli_flag: Flag, path: str) -> Porter:
         '''创建新 Porter'''
         sid = uuid4().bytes
         if cli_flag == Flag.PULL:
@@ -77,17 +77,17 @@ class Server(Thread):
             include = _path['include']
             exclude = _path['exclude']
             logging.debug(f'[Server] New task-{sid.hex()} for send {path}')
-            self.transporters[sid] = Sender(sid, srcs, self.max_conn,
-                                            include, exclude)
+            self.porters[sid] = Sender(sid, srcs, self.max_conn,
+                                       include, exclude)
         else:
             logging.debug(f'[Server] New task-{sid.hex()} for recv {path}')
-            self.transporters[sid] = Receiver(sid, path, self.max_conn)
-        return self.transporters[sid]
+            self.porters[sid] = Receiver(sid, path, self.max_conn)
+        return self.porters[sid]
 
-    def close_all_transporters(self):
+    def close_all_porters(self):
         '''关闭所有 Porter'''
-        logging.debug('[Server] Closing all transporters.')
-        for porter in self.transporters.values():
+        logging.debug('[Server] Closing all porters.')
+        for porter in self.porters.values():
             porter.close()
 
     def run(self):

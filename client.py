@@ -204,6 +204,7 @@ class Client:
 
     def handshake(self, remote_path: str):
         '''握手'''
+        logging.info('[Client] Handshaking...')
         channel = self.tunnels[0][1]
         conn_pkt = Packet.load(self.action, remote_path)
         send_msg(channel, conn_pkt)
@@ -213,7 +214,7 @@ class Client:
 
         return session_id
 
-    def attched_connect(self, session_id, pkey, password):
+    def attched_connect(self, porter, session_id, pkey, password):
         '''后续连接'''
         addr = (self.host, self.port)
         attach_pkt = Packet.load(Flag.ATTACH, session_id)
@@ -223,6 +224,7 @@ class Client:
             sock = create_connection(addr)
             channel = self.new_channel(sock, self.username, pkey, password)
             send_msg(channel, attach_pkt)
+            porter.conn_pool.add(channel)
             logging.info(f'[Client] Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
@@ -231,7 +233,7 @@ class Client:
     def start(self):
         '''主函数'''
         try:
-            logging.info('[Client] Connecting to server')
+            logging.info('[Client] Connecting to server...')
             channel, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
@@ -249,7 +251,7 @@ class Client:
 
             porter.start()
             porter.conn_pool.add(channel)
-            self.attched_connect(session_id, pkey, password)
+            self.attched_connect(porter, session_id, pkey, password)
             porter.join()
         except Exception as e:
             from traceback import print_exc
