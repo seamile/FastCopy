@@ -139,7 +139,7 @@ class Client:
         self._chanid += 1
         return f'{self._chanid:03d}'
 
-    def new_channel(self, sock, user, pkey, password):
+    def new_channel(self, sock, user, pkey, password, num=1):
         '''create a new Channel'''
         try:
             tp = paramiko.Transport(sock)
@@ -151,11 +151,14 @@ class Client:
             return
 
         try:
-            channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
-            channel.settimeout(TIMEOUT)
-            self.tunnels.append((tp, channel))
-            channel.set_name(self.new_channel_name())
-            return channel
+            conns = [tp]
+            for _ in range(num):
+                channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
+                channel.settimeout(TIMEOUT)
+                channel.set_name(self.new_channel_name())
+                conns.append(channel)
+            self.tunnels.append(conns)
+            return conns[1:]
         except paramiko.ChannelException:
             sys.exit(1)
 
@@ -188,16 +191,16 @@ class Client:
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
             pkey = self.load_key(_path)
-            channel = self.new_channel(sock, self.username, pkey, None)
-            if channel is not None:
-                return channel, pkey, None
+            channels = self.new_channel(sock, self.username, pkey, None)
+            if channels:
+                return channels[0], pkey, None
 
         # try to auth with password
         for _ in range(3):
             password = getpass(f'password for {self.username}@{self.host}: ')
-            channel = self.new_channel(sock, self.username, None, password)
-            if channel is not None:
-                return channel, None, password
+            channels = self.new_channel(sock, self.username, None, password)
+            if channels:
+                return channels[0], None, password
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
@@ -222,10 +225,11 @@ class Client:
         def _connect(wait):
             sleep(wait)
             sock = create_connection(addr)
-            channel = self.new_channel(sock, self.username, pkey, password)
-            send_msg(channel, attach_pkt)
-            porter.conn_pool.add(channel)
-            logging.info(f'[Client] Channel {channel.get_name()} connected')
+            channels = self.new_channel(sock, self.username, pkey, password, 3)
+            for channel in channels:
+                send_msg(channel, attach_pkt)
+                porter.conn_pool.add(channel)
+                logging.info(f'[Client] Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
             Thread(target=_connect, args=(0.5 * i,), daemon=True).start()

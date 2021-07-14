@@ -21,7 +21,7 @@ from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-CHUNK_SIZE = 1400  # 默认数据块大小 (单位: 字节)
+CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
@@ -221,16 +221,15 @@ class ConnectionPool(Thread):
         while not self.done.is_set():
             packet: Packet = self.send_q.get()
             send_msg(conn, packet)
-            logging.debug(f'[Send] from {conn_name}: {packet.flag.name} '
+            logging.debug(f'[Send] conn-{conn_name}: {packet.flag.name} '
                           f'chk={packet.chksum:08x} len={packet.length}')
 
     def _recv(self, conn: socket):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             try:
-                logging.debug(f'[Recv] conn {conn_name} listening...')
                 packet = recv_msg(conn)
-                logging.debug(f'[Recv] from {conn_name}: {packet.flag.name} '
+                logging.debug(f'[Recv] conn-{conn_name}: {packet.flag.name} '
                               f'chk={packet.chksum:08x} len={packet.length}')
             except Exception as e:
                 logging.error(f'[Recv] Error: {e}')
