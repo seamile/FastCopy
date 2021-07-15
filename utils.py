@@ -38,18 +38,19 @@ progress = Progress(
 
 
 class Flag(IntEnum):
-    PUSH = 1        # 推送申请
-    PULL = 2        # 拉取申请
-    SID = 3         # 建立会话
-    ATTACH = 4      # 后续连接
-    MONOFILE = 5    # 传输模式
-    DIR_INFO = 6    # 文件信息
-    FILE_INFO = 7   # 文件信息
-    FILE_READY = 8  # 文件就绪
-    FILE_CHUNK = 9  # 数据传输
-    DONE = 10       # 完成
-    RESEND = 11     # 错误回传
-    EXCEPTION = 12  # 异常退出
+    PUSH = 1         # 推送申请
+    PULL = 2         # 拉取申请
+    SID = 3          # 建立会话
+    ATTACH = 4       # 后续连接
+    MONOFILE = 5     # 传输模式
+    DIR_INFO = 6     # 文件信息
+    FILE_INFO = 7    # 文件信息
+    FILE_COUNT = 8   # 文件数量
+    FILE_READY = 9   # 文件就绪
+    FILE_CHUNK = 10  # 数据传输
+    DONE = 11        # 完成
+    RESEND = 12      # 错误回传
+    EXCEPTION = 13   # 异常退出
 
     @classmethod
     def contains(cls, member: object) -> bool:
@@ -89,6 +90,8 @@ class Packet(NamedTuple):
         elif flag == Flag.FILE_INFO:
             length = len(args[-1])
             body = pack(f'>IHQd16s{length}s', *args)
+        elif flag == Flag.FILE_COUNT:
+            body = pack('>I', *args)
         elif flag == Flag.FILE_READY:
             body = pack('>I', *args)
         elif flag == Flag.FILE_CHUNK:
@@ -137,6 +140,9 @@ class Packet(NamedTuple):
             #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
             fmt = f'>IHQd16s{self.length - 38}s'
             return unpack(fmt, self.body)
+
+        elif self.flag == Flag.FILE_COUNT:
+            return unpack('>I', self.body)  # file count
 
         elif self.flag == Flag.FILE_READY:
             return unpack('>I', self.body)  # file id
@@ -529,27 +535,30 @@ class Sender(Thread):
                     self.tree[_id] = inf_cls.load(_id, fullpath, relpath)
 
                     # 将 文件/目录 信息发送给接收端
-                    packet = Packet.load(flag, *self.tree[_id])
-                    self.conn_pool.send(packet)
-
+                    info_pkt = Packet.load(flag, *self.tree[_id])
+                    self.conn_pool.send(info_pkt)
                     logging.debug(f'[Sender] Found {inf_cls.__name__}: '
                                   f'id={_id} path={relpath.as_posix()}')
+
                     _id += 1
                 else:
                     logging.debug(f'[Sender] Name conflict: '
                                   f'{relpath.as_posix()}, ignore.')
 
+        count_pkt = Packet.load(Flag.FILE_COUNT, _id)
+        self.conn_pool.send(count_pkt)
         logging.info(f'[Sender] Num of files and dirs: {_id}')
-        return _id  # _id = n_files + n_dirs
 
     def run(self):
-        logging.debug(f'Sender-{self.sid.hex()[:8]} is running')
+        logging.debug(f'[Sender] Sender-{self.sid.hex()[:8]} is running')
         self.conn_pool.start()  # 启动网络连接池
 
         # 通知对端是否是单文件
-        is_monofile = len(self.srcs) == 1 and os.path.isfile(self.srcs[0])
-        packet = Packet.load(Flag.MONOFILE, is_monofile)
-        self.conn_pool.send(packet)
+        is_monofile = (len(self.srcs) == 1
+                       and not has_magic(self.srcs[0])
+                       and self.abspath(self.srcs[0]).is_file())
+        mono_pkt = Packet.load(Flag.MONOFILE, is_monofile)
+        self.conn_pool.send(mono_pkt)
 
         # 整理所有文件
         Thread(target=self.prepare_all_files, daemon=True).start()
@@ -561,16 +570,16 @@ class Sender(Thread):
             except Empty:
                 logging.error('[Sender] get input queue timeout, exit.')
                 break
+
+            if packet.flag == Flag.FILE_READY:
+                f_id, = packet.unpack_body()
+                for chunk_packet in self.tree[f_id].iread():
+                    self.conn_pool.send(chunk_packet)
+            elif packet.flag == Flag.DONE:
+                logging.info('[Sender] All files are processed, exit.')
+                break
             else:
-                if packet.flag == Flag.FILE_READY:
-                    f_id, = packet.unpack_body()
-                    for chunk_packet in self.tree[f_id].iread():
-                        self.conn_pool.send(chunk_packet)
-                elif packet.flag == Flag.DONE:
-                    logging.info('[Sender] All files are processed, exit.')
-                    break
-                else:
-                    logging.error(f'[Sender] Unknow packet: {packet}')
+                logging.error(f'[Sender] Unknow packet: {packet}')
 
         self.conn_pool.stop()
         logging.debug(f'Sender-{self.sid.hex()[:8]} exit')
@@ -588,6 +597,7 @@ class Receiver(Thread):
         self.size = 0
         self.is_monofile = True
         self.n_recv = 0
+        self.total = 0xffffffff
         self.use_custom_name = False
         self.concurrency = Semaphore(8)  # 允许同时写入的文件数
         self.files: Dict[int, FileInfo] = {}
@@ -729,7 +739,7 @@ class Receiver(Thread):
             return
 
         # 等待接收文件信息和数据
-        while True:
+        while self.n_recv < self.total:
             packet = self.conn_pool.recv()
             if packet.flag == Flag.DIR_INFO:
                 self.process_dir_info(packet)
@@ -740,10 +750,8 @@ class Receiver(Thread):
             elif packet.flag == Flag.FILE_CHUNK:
                 self.process_file_chunk(packet)
 
-            elif packet.flag == Flag.DONE:
-                self.conn_pool.send(Packet.load(Flag.DONE, EOF))
-                logging.info('[Receiver] All files finished.')
-                break
+            elif packet.flag == Flag.FILE_COUNT:
+                self.total, = packet.unpack_body()
 
             elif packet.flag == Flag.EXCEPTION:
                 msg, = packet.unpack_body()
@@ -752,6 +760,9 @@ class Receiver(Thread):
 
             else:
                 logging.error(f'[Receiver] Unknow packet flag: {packet.flag}')
+
+        self.conn_pool.send(Packet.load(Flag.DONE, EOF))
+        logging.info('[Receiver] All files finished.')
 
         self.conn_pool.stop()
         logging.debug(f'Receiver-{self.sid.hex()[:8]} exit')
