@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import logging
 
 from binascii import crc32
@@ -13,11 +12,13 @@ from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
 from socket import socket, MSG_WAITALL
-# from socket import timeout as TimeoutError, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
 from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
                     Tuple, Union)
+
+from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
+                           TransferSpeedColumn)
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
@@ -26,6 +27,14 @@ TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
 EOF = 0xffffffff
+
+progress = Progress(
+    TextColumn("[bold blue]{task.fields[filename]}"),
+    BarColumn(bar_width=60),
+    TransferSpeedColumn(),
+    "•",
+    "[progress.percentage]{task.percentage:>3.1f}%"
+)
 
 
 class Flag(IntEnum):
@@ -337,6 +346,10 @@ class FileInfo:
                 f'sz={self.size}, path={self.s_relpath})')
 
     @property
+    def name(self) -> str:
+        return self.abspath.name
+
+    @property
     def n_chunks(self):
         return ceil(self.size / CHUNK_SIZE)
 
@@ -534,8 +547,8 @@ class Sender(Thread):
         self.conn_pool.start()  # 启动网络连接池
 
         # 通知对端是否是单文件
-        monofile = len(self.srcs) == 1 and os.path.isfile(self.srcs[0])
-        packet = Packet.load(Flag.MONOFILE, monofile)
+        is_monofile = len(self.srcs) == 1 and os.path.isfile(self.srcs[0])
+        packet = Packet.load(Flag.MONOFILE, is_monofile)
         self.conn_pool.send(packet)
 
         # 整理所有文件
@@ -576,10 +589,11 @@ class Receiver(Thread):
         self.is_monofile = True
         self.n_recv = 0
         self.use_custom_name = False
-        self.concurrency = Semaphore(32)  # 允许同时写入的文件数
+        self.concurrency = Semaphore(8)  # 允许同时写入的文件数
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
         self.ready_files: Deque[int] = deque()
+        self.progress_tasks: Dict[int, TaskID] = {}
 
     def check_dst_path(self):
         '''检查目标路径'''
@@ -613,15 +627,25 @@ class Receiver(Thread):
         while self.ready_files:
             if self.concurrency.acquire(False):
                 f_id = self.ready_files[0]
+                f_info = self.files[f_id]
                 # 创建写入迭代器
-                self.iwriters[f_id] = self.files[f_id].iwrite()
+                self.iwriters[f_id] = f_info.iwrite()
                 self.iwriters[f_id].send(None)
 
                 # 通知对端：文件准备就绪
-                logging.info(f'[Receiver] File({f_id}) ready')
+                logging.debug(f'[Receiver] File({f_id}) ready')
                 ready_pkt = Packet.load(Flag.FILE_READY, f_id)
                 self.conn_pool.send(ready_pkt)
                 self.ready_files.popleft()
+
+                # 添加进度条任务
+                task_id = progress.add_task(
+                    f'download-{f_info.name}',
+                    filename=f_info.name,
+                    total=f_info.size,
+                    start=True
+                )
+                self.progress_tasks[f_id] = task_id
             else:
                 break
 
@@ -638,7 +662,7 @@ class Receiver(Thread):
         if f_info.is_vaild():
             f_info.set_stat()
             self.n_recv += 1
-            logging.info(f'[Receiver] File skiped: {f_info.s_relpath}.')
+            logging.info(f'[Receiver] File finished: {f_info.s_relpath}.')
         else:
             if f_info.size > 0:
                 self.files[f_info.id] = f_info
@@ -668,6 +692,7 @@ class Receiver(Thread):
                           f'into {self.files[f_id].s_relpath}')
             iwriter = self.get_iwriter(f_id)
             iwriter.send((seq, chunk))
+            progress.update(self.progress_tasks[f_id], advance=len(chunk))
         except StopIteration:
             # 释放并发计数器
             self.concurrency.release()
@@ -685,26 +710,6 @@ class Receiver(Thread):
                               f'{self.files[f_id].s_relpath}')
 
         return len(chunk)
-
-    def print_progess(self, current_size):
-        now = time.time()
-        interval = 3
-
-        if not hasattr(self, '_last_time'):
-            self._last_time = now
-            self._last_size = 0
-
-        if now - self._last_time >= interval:
-            delta_size = (current_size - self._last_size) / interval
-            if delta_size < 1024:
-                speed = f'{delta_size:6.1f} B/s'
-            elif delta_size < 1048576:
-                speed = f'{delta_size // 1024:6.1f} KB/s'
-            else:
-                speed = f'{delta_size // 1048576:6.1f} MB/s'
-            logging.info(f'Progress: {current_size / self.size: 7.2%} {speed}')
-            self._last_time = now
-            self._last_size = current_size
 
     def run(self):
         logging.debug(f'Receiver-{self.sid.hex()[:8]} is running')

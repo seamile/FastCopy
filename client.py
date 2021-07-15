@@ -4,6 +4,7 @@ import os
 import sys
 import logging
 import paramiko
+import signal
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
 from json import dumps
@@ -13,10 +14,11 @@ from textwrap import dedent
 from threading import Thread
 from time import sleep
 from typing import List
+from functools import partial
 
 from utils import Flag, SERVER_ADDR, TIMEOUT
 from utils import Packet, send_msg, recv_msg
-from utils import Sender, Receiver
+from utils import Sender, Receiver, progress
 
 
 class Client:
@@ -88,6 +90,9 @@ class Client:
 
     def set_log(self, verbose_mode):
         '''处理日志'''
+        global print
+        print = partial(progress.print, style='blue')
+
         log_level = {
             0: logging.ERROR,
             1: logging.WARNING,
@@ -95,7 +100,15 @@ class Client:
             3: logging.DEBUG
         }.get(verbose_mode, logging.ERROR)
 
-        logging.basicConfig(level=log_level, format='%(message)s')
+        if log_level <= logging.ERROR:
+            logging.error = partial(progress.print, style='red')
+        if log_level <= logging.WARNING:
+            logging.warning = partial(progress.print, style='yellow')
+        if log_level <= logging.INFO:
+            print = partial(progress.print, style='blue')
+        if log_level <= logging.DEBUG:
+            logging.debug = partial(progress.print, style='white')
+
         paramiko_logger = logging.getLogger("paramiko")
         paramiko_logger.setLevel(logging.ERROR)
 
@@ -214,13 +227,12 @@ class Client:
 
     def handshake(self, remote_path: str):
         '''握手'''
-        logging.info('[Client] Handshaking...')
         channel = self.tunnels[0][1]
         conn_pkt = Packet.load(self.action, remote_path)
         send_msg(channel, conn_pkt)
         session_pkt = recv_msg(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'[Client] Channel {channel.get_name()} connected')
+        logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
 
         return session_id
 
@@ -236,7 +248,7 @@ class Client:
             for channel in channels:
                 send_msg(channel, attach_pkt)
                 porter.conn_pool.add(channel)
-                logging.info(f'[Client] Channel {channel.get_name()} connected')
+                logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
             Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
@@ -244,7 +256,8 @@ class Client:
     def start(self):
         '''主函数'''
         try:
-            logging.info('[Client] Connecting to server...')
+            progress.start()
+            print('[cyan]fcp[/cyan]: connecting to server ...')
             channel, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
@@ -255,20 +268,35 @@ class Client:
                 }, ensure_ascii=False, separators=(',', ':'))
                 session_id = self.handshake(remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
+                print('[cyan]fcp[/cyan]: receiving files ...')
             else:
                 session_id = self.handshake(self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
+                print('[cyan]fcp[/cyan]: sending files ...')
 
             porter.start()
             porter.conn_pool.add(channel)
             self.attched_connect(porter, session_id, pkey, password)
             porter.join()
+            print('[cyan]fcp[/cyan]: finished.')
         except Exception as e:
             from traceback import print_exc
-            logging.error(f'[Client] {e}, exit.')
+            logging.error(f'[cyan]fcp[/cyan]: {e}, exit.')
             print_exc()
             sys.exit(1)
+        finally:
+            progress.stop()
+
+
+def handle_sigint(signum, frame):
+    '''键盘中断事件的处理'''
+    logging.error('[cyan]fcp[/cyan]: user canceled.')
+    progress.stop()
+    sys.exit(1)
+
+
+signal.signal(signal.SIGINT, handle_sigint)
 
 
 if __name__ == '__main__':
@@ -290,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('-F', dest='ssh_config', type=str, default=None,
                         help='The config file for SSH (default: ~/.ssh/config)')
 
-    parser.add_argument('-n', dest='num', type=int, default=16,
+    parser.add_argument('-n', dest='num', type=int, default=4,
                         help='Max number of connections (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
