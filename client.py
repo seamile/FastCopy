@@ -51,7 +51,7 @@ class Client:
         self.exclude = [p for p in args.exclude.split(',') if p]
 
         # the ssh tunnels
-        # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
+        # inside: [(paramiko.Transport, paramiko.Channel, ...), ...]
         self.tunnels: List = []
 
     @staticmethod
@@ -211,23 +211,22 @@ class Client:
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
             pkey = self.load_pkey(_path)
-            channels = self.new_channel(sock, self.username, pkey, None)
+            channels = self.new_channel(sock, self.username, pkey, None, 1)
             if channels:
-                return channels[0], pkey, None
+                return channels, pkey, None
 
         # try to auth with password
         for _ in range(3):
             password = getpass(f'password for {self.username}@{self.host}: ')
-            channels = self.new_channel(sock, self.username, None, password)
+            channels = self.new_channel(sock, self.username, None, password, 1)
             if channels:
-                return channels[0], None, password
+                return channels, None, password
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
 
-    def handshake(self, remote_path: str):
+    def handshake(self, channel, remote_path: str):
         '''握手'''
-        channel = self.tunnels[0][1]
         conn_pkt = Packet.load(self.action, remote_path)
         send_msg(channel, conn_pkt)
         session_pkt = recv_msg(channel)
@@ -244,7 +243,7 @@ class Client:
         def _connect(wait):
             sleep(wait)
             sock = create_connection(addr)
-            channels = self.new_channel(sock, self.username, pkey, password, 3)
+            channels = self.new_channel(sock, self.username, pkey, password, 4)
             for channel in channels:
                 send_msg(channel, attach_pkt)
                 porter.conn_pool.add(channel)
@@ -258,7 +257,7 @@ class Client:
         try:
             progress.start()
             print('[cyan]fcp[/cyan]: connecting to server ...')
-            channel, pkey, password = self.first_connect()
+            channels, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
                 remote_path = dumps({
@@ -266,17 +265,18 @@ class Client:
                     'include': self.include,
                     'exclude': self.exclude
                 }, ensure_ascii=False, separators=(',', ':'))
-                session_id = self.handshake(remote_path)
+                session_id = self.handshake(channels[0], remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
                 print('[cyan]fcp[/cyan]: receiving files ...')
             else:
-                session_id = self.handshake(self.dst)
+                session_id = self.handshake(channels[0], self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
                 print('[cyan]fcp[/cyan]: sending files ...')
 
             porter.start()
-            porter.conn_pool.add(channel)
+            for chan in channels:
+                porter.conn_pool.add(chan)
             self.attched_connect(porter, session_id, pkey, password)
             porter.join()
             print('[cyan]fcp[/cyan]: finished.')
@@ -318,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('-F', dest='ssh_config', type=str, default=None,
                         help='The config file for SSH (default: ~/.ssh/config)')
 
-    parser.add_argument('-n', dest='num', type=int, default=4,
+    parser.add_argument('-n', dest='num', type=int, default=8,
                         help='Max number of connections (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,

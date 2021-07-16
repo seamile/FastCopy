@@ -22,7 +22,7 @@ from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
+CHUNK_SIZE = 16384  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
@@ -188,7 +188,7 @@ def recv_all(conn: Union[socket, Channel], length: int) -> bytes:
                 length -= n_recv
                 datagram.extend(_data)
             else:
-                break
+                return _data
         return bytes(datagram)
 
 
@@ -196,22 +196,22 @@ def recv_msg(conn: Union[socket, Channel]) -> Packet:
     '''接收数据报文'''
     # 接收并解析 head 部分
     head = recv_all(conn, LEN_HEAD)
-    if len(head) == LEN_HEAD:
-        flag, chksum, len_body = Packet.unpack_head(head)
+    if not head:
+        raise ConnectionResetError
     else:
-        raise ValueError
+        flag, chksum, len_body = Packet.unpack_head(head)
 
     if not Flag.contains(flag):
-        raise ValueError
+        raise ValueError  # TODO: 错误重传
 
     # 接收 body 部分
     body = recv_all(conn, len_body)
-
-    # 错误重传
-    if len(body) != len_body or crc32(body) != chksum:
-        raise ValueError
-
-    return Packet(flag, body)
+    if not body:
+        raise ConnectionResetError
+    elif crc32(body) != chksum:
+        raise ValueError  # TODO: 错误重传
+    else:
+        return Packet(flag, body)
 
 
 class ConnectionPool(Thread):
@@ -246,10 +246,10 @@ class ConnectionPool(Thread):
                 packet = recv_msg(conn)
                 logging.debug(f'[Recv] conn-{conn_name}: {packet.flag.name} '
                               f'chk={packet.chksum:08x} len={packet.length}')
-            except Exception as e:
-                logging.error(f'[Recv] Error: {e}')
+            except ConnectionResetError:
                 return
-            self.recv_q.put(packet)
+            else:
+                self.recv_q.put(packet)
 
     def add(self, conn: socket):
         '''添加一个连接'''
