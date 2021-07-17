@@ -11,7 +11,7 @@ from uuid import uuid4
 import daemon
 
 from utils import Flag, SERVER_ADDR
-from utils import Packet, send_msg, recv_msg
+from utils import Packet, send_pkt, recv_pkt
 from utils import Sender, Receiver, Porter
 
 
@@ -27,7 +27,7 @@ class WatchDog(Thread):
             logging.debug('[WatchDog] waiting for handshake from %s:%d'
                           % self.sock.getpeername())
             self.sock.settimeout(60)
-            packet = recv_msg(self.sock)
+            packet = recv_pkt(self.sock)
             self.sock.settimeout(None)
         except TimeoutError:
             # 超时退出
@@ -44,7 +44,7 @@ class WatchDog(Thread):
 
             # 将 SID 发送给客户端
             packet = Packet.load(Flag.SID, porter.sid)
-            send_msg(self.sock, packet)
+            send_pkt(self.sock, packet)
 
         elif packet.flag == Flag.ATTACH:
             sid, = packet.unpack_body()

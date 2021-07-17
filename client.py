@@ -17,7 +17,7 @@ from typing import List
 from functools import partial
 
 from utils import Flag, SERVER_ADDR, TIMEOUT
-from utils import Packet, send_msg, recv_msg
+from utils import Packet, send_pkt, recv_pkt
 from utils import Sender, Receiver, progress
 
 
@@ -228,8 +228,8 @@ class Client:
     def handshake(self, channel, remote_path: str):
         '''握手'''
         conn_pkt = Packet.load(self.action, remote_path)
-        send_msg(channel, conn_pkt)
-        session_pkt = recv_msg(channel)
+        send_pkt(channel, conn_pkt)
+        session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
         logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
 
@@ -245,7 +245,7 @@ class Client:
             sock = create_connection(addr)
             channels = self.new_channel(sock, self.username, pkey, password, 4)
             for channel in channels:
-                send_msg(channel, attach_pkt)
+                send_pkt(channel, attach_pkt)
                 porter.conn_pool.add(channel)
                 logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
 

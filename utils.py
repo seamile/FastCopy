@@ -1,17 +1,17 @@
 import os
 import re
 import logging
-
 from binascii import crc32
 from collections import deque
 from enum import IntEnum
 from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
+import sys
 from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
-from socket import socket, MSG_WAITALL
+from socket import socket, MSG_WAITALL, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
 from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
@@ -22,11 +22,11 @@ from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-CHUNK_SIZE = 16384  # 默认数据块大小 (单位: 字节)
+CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
+MAX_SEQ = 0xffffffff
 
-EOF = 0xffffffff
 
 progress = Progress(
     TextColumn("[bold blue]{task.fields[filename]}"),
@@ -57,12 +57,33 @@ class Flag(IntEnum):
         return member in cls.__members__.values()
 
 
+class DictQueue(dict):
+    def __init__(self, size=None):
+        super().__init__()
+        self.size = size or float('inf')
+        self.cur_seq = 0
+
+    def put(self, value):
+        while len(self) >= self.size:
+            self.pop()
+
+        self[self.cur_seq] = value
+        self.cur_seq = (self.cur_seq + 1) & MAX_SEQ
+
+    def pop(self, seq=None):
+        if seq is None:
+            seq = min(self.keys())
+        return super().pop(seq)
+
+
 class Packet(NamedTuple):
     flag: Flag
     body: bytes
 
     def __str__(self) -> str:
-        return f'Flag: {self.flag} Len={self.length}'
+        return (f'Packet: {self.flag.name} '
+                f'len={self.length} '
+                f'chk={self.chksum:08x}')
 
     @property
     def length(self) -> int:
@@ -98,9 +119,9 @@ class Packet(NamedTuple):
             length = len(args[-1])
             body = pack(f'>2I{length}s', *args)
         elif flag == Flag.DONE:
-            body = pack('>I', EOF)
+            body = pack('>?', True)
         elif flag == Flag.RESEND:
-            body = pack('>BIH', *args)
+            body = pack('>I', *args)
         elif flag == Flag.EXCEPTION:
             body = str(args[0]).encode('utf8')
         else:
@@ -116,7 +137,10 @@ class Packet(NamedTuple):
     def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
         '''解析 head'''
         flag, chksum, length = unpack('>BIH', head)
-        return Flag(flag), chksum, length
+        if not Flag.contains(flag):
+            raise PacketError
+        else:
+            return Flag(flag), chksum, length
 
     def unpack_body(self) -> Tuple[Any, ...]:
         '''将 body 解包'''
@@ -154,10 +178,10 @@ class Packet(NamedTuple):
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.DONE:
-            return unpack('>I', self.body)
+            return unpack('>?', self.body)
 
         elif self.flag == Flag.RESEND:
-            return unpack('>BIH', self.body)
+            return unpack('>I', self.body)
 
         elif self.flag == Flag.EXCEPTION:
             return (self.body.decode('utf-8'),)
@@ -170,7 +194,11 @@ class Packet(NamedTuple):
         return self.chksum == chksum
 
 
-def send_msg(conn: Union[socket, Channel], packet: Packet):
+class PacketError(Exception):
+    pass
+
+
+def send_pkt(conn: Union[socket, Channel], packet: Packet):
     '''发送数据报文'''
     datagram = packet.pack()
     conn.send(datagram)
@@ -192,7 +220,7 @@ def recv_all(conn: Union[socket, Channel], length: int) -> bytes:
         return bytes(datagram)
 
 
-def recv_msg(conn: Union[socket, Channel]) -> Packet:
+def recv_pkt(conn: Union[socket, Channel]) -> Packet:
     '''接收数据报文'''
     # 接收并解析 head 部分
     head = recv_all(conn, LEN_HEAD)
@@ -201,15 +229,12 @@ def recv_msg(conn: Union[socket, Channel]) -> Packet:
     else:
         flag, chksum, len_body = Packet.unpack_head(head)
 
-    if not Flag.contains(flag):
-        raise ValueError  # TODO: 错误重传
-
     # 接收 body 部分
     body = recv_all(conn, len_body)
     if not body:
         raise ConnectionResetError
     elif crc32(body) != chksum:
-        raise ValueError  # TODO: 错误重传
+        raise PacketError  # 错误重传
     else:
         return Packet(flag, body)
 
@@ -220,8 +245,8 @@ class ConnectionPool(Thread):
     def __init__(self, size=16):
         super().__init__(daemon=True)
         self.size = min(size, self._max_size)
-        self.send_q = Queue(size * 5)
-        self.recv_q = Queue(size * 5)
+        self.send_q = Queue()
+        self.recv_q = Queue()
         self.done = Event()
         self.connections = {}
 
@@ -231,25 +256,44 @@ class ConnectionPool(Thread):
     def recv(self, timeout=TIMEOUT) -> Packet:
         return self.recv_q.get(timeout)
 
-    def _send(self, conn: socket):
+    def _send(self, conn: socket, cache: DictQueue):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             packet: Packet = self.send_q.get()
-            send_msg(conn, packet)
-            logging.debug(f'[Send] conn-{conn_name}: {packet.flag.name} '
-                          f'chk={packet.chksum:08x} len={packet.length}')
+            try:
+                send_pkt(conn, packet)
+            except SocketError as e:
+                logging.error(e)
+                sys.exit(1)
 
-    def _recv(self, conn: socket):
+            logging.debug(f'[Send] conn-{conn_name}/{cache.cur_seq}: {packet}')
+            cache.put(packet)
+
+    def _recv(self, conn: socket, cache: DictQueue):
+        n_recv = 0
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             try:
-                packet = recv_msg(conn)
-                logging.debug(f'[Recv] conn-{conn_name}: {packet.flag.name} '
-                              f'chk={packet.chksum:08x} len={packet.length}')
+                packet = recv_pkt(conn)
             except ConnectionResetError:
                 return
+            except PacketError:
+                resend_pkt = Packet.load(Flag.RESEND, n_recv)
+                send_pkt(conn, resend_pkt)
+                continue
+
+            if packet.flag is Flag.RESEND:
+                seq, = packet.unpack_body()
+                if seq not in cache:
+                    seqs = ','.join(cache.keys())
+                    logging.error(f"{seq} not in {seqs}")
+                    sys.exit(1)
+                pkt = cache.pop(seq)
+                self.send(pkt)
             else:
+                logging.debug(f'[Recv] conn-{conn_name}/{cache.cur_seq}: {packet}')
                 self.recv_q.put(packet)
+                n_recv = (n_recv + 1) & MAX_SEQ
 
     def add(self, conn: socket):
         '''添加一个连接'''
@@ -260,10 +304,11 @@ class ConnectionPool(Thread):
         if conn in self.connections:
             return True
 
-        t_send = Thread(target=self._send, args=(conn,), daemon=True)
+        cache = DictQueue(128)
+        t_send = Thread(target=self._send, args=(conn, cache), daemon=True)
         t_send.start()
 
-        t_recv = Thread(target=self._recv, args=(conn,), daemon=True)
+        t_recv = Thread(target=self._recv, args=(conn, cache), daemon=True)
         t_recv.start()
         return True
 
@@ -701,8 +746,8 @@ class Receiver(Thread):
             logging.debug(f'[Receiver] Write chunk({seq}) '
                           f'into {self.files[f_id].s_relpath}')
             iwriter = self.get_iwriter(f_id)
-            iwriter.send((seq, chunk))
             progress.update(self.progress_tasks[f_id], advance=len(chunk))
+            iwriter.send((seq, chunk))
         except StopIteration:
             # 释放并发计数器
             self.concurrency.release()
@@ -715,7 +760,7 @@ class Receiver(Thread):
                 logging.info(f'[Receiver] File finished: '
                              f'{self.files[f_id].s_relpath}')
             else:
-                # TODO: 错误重传机制
+                # TODO: 错误重传
                 logging.error(f'[Receiver] Bad file hash: '
                               f'{self.files[f_id].s_relpath}')
 
@@ -761,7 +806,7 @@ class Receiver(Thread):
             else:
                 logging.error(f'[Receiver] Unknow packet flag: {packet.flag}')
 
-        self.conn_pool.send(Packet.load(Flag.DONE, EOF))
+        self.conn_pool.send(Packet.load(Flag.DONE))
         logging.info('[Receiver] All files finished.')
 
         self.conn_pool.stop()
