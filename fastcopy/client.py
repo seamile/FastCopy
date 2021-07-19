@@ -16,9 +16,9 @@ from time import sleep
 from typing import List
 from functools import partial
 
-from utils import Flag, SERVER_ADDR, TIMEOUT
-from utils import Packet, send_pkt, recv_pkt
-from utils import Sender, Receiver, progress
+from .utils import Flag, SERVER_ADDR, TIMEOUT
+from .utils import Packet, send_pkt, recv_pkt
+from .utils import Sender, Receiver, progress
 
 
 class Client:
@@ -301,7 +301,7 @@ def handle_sigint(signum, frame):
 signal.signal(signal.SIGINT, handle_sigint)
 
 
-if __name__ == '__main__':
+def main():
     parser = ArgumentParser(
         prog='fcp',
         formatter_class=RawDescriptionHelpFormatter,
@@ -337,3 +337,7 @@ if __name__ == '__main__':
 
     cli = Client(parser)
     cli.start()
+
+
+if __name__ == '__main__':
+    main()

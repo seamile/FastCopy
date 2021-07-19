@@ -43,7 +43,7 @@ class Flag(IntEnum):
     SID = 3          # 建立会话
     ATTACH = 4       # 后续连接
     MONOFILE = 5     # 传输模式
-    DIR_INFO = 6     # 文件信息
+    DIR_INFO = 6     # 目录信息
     FILE_INFO = 7    # 文件信息
     FILE_COUNT = 8   # 文件数量
     FILE_READY = 9   # 文件就绪

@@ -10,9 +10,9 @@ from uuid import uuid4
 
 import daemon
 
-from utils import Flag, SERVER_ADDR
-from utils import Packet, send_pkt, recv_pkt
-from utils import Sender, Receiver, Porter
+from .utils import Flag, SERVER_ADDR
+from .utils import Packet, send_pkt, recv_pkt
+from .utils import Sender, Receiver, Porter
 
 
 class WatchDog(Thread):
@@ -103,7 +103,7 @@ class Server(Thread):
             dog.start()
 
 
-if __name__ == '__main__':
+def main():
     parser = ArgumentParser()
     parser.add_argument('-d',
                         dest='daemon',
@@ -145,3 +145,7 @@ if __name__ == '__main__':
         server = Server(args.concurrency)
         server.start()
         server.join()
+
+
+if __name__ == '__main__':
+    main()
