@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import logging
 from binascii import crc32
 from collections import deque
@@ -7,7 +8,6 @@ from enum import IntEnum
 from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
-import sys
 from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
@@ -68,12 +68,15 @@ class DictQueue(dict):
             self.pop()
 
         self[self.cur_seq] = value
+        logging.debug(f'[DictQueue] put {self.cur_seq} to {value} into {id(self)}')
         self.cur_seq = (self.cur_seq + 1) & MAX_SEQ
 
     def pop(self, seq=None):
         if seq is None:
             seq = min(self.keys())
-        return super().pop(seq)
+        value = super().pop(seq)
+        logging.debug(f'[DictQueue] pop {seq} as {value} from {id(self)}')
+        return value
 
 
 class Packet(NamedTuple):
@@ -285,7 +288,7 @@ class ConnectionPool(Thread):
             if packet.flag is Flag.RESEND:
                 seq, = packet.unpack_body()
                 if seq not in cache:
-                    seqs = ','.join(cache.keys())
+                    seqs = ','.join(f'{k}' for k in cache.keys())
                     logging.error(f"{seq} not in {seqs}")
                     sys.exit(1)
                 pkt = cache.pop(seq)
@@ -304,7 +307,7 @@ class ConnectionPool(Thread):
         if conn in self.connections:
             return True
 
-        cache = DictQueue(128)
+        cache = DictQueue(256)
         t_send = Thread(target=self._send, args=(conn, cache), daemon=True)
         t_send.start()
 
@@ -618,11 +621,25 @@ class Sender(Thread):
 
             if packet.flag == Flag.FILE_READY:
                 f_id, = packet.unpack_body()
-                for chunk_packet in self.tree[f_id].iread():
+                f_info = self.tree[f_id]
+
+                # 添加进度条任务
+                task_id = progress.add_task(
+                    f'upload-{f_info.name}',
+                    filename=f_info.name,
+                    total=f_info.size,
+                    start=True
+                )
+
+                # 发送文件数据块
+                for chunk_packet in f_info.iread():
                     self.conn_pool.send(chunk_packet)
+                    progress.update(task_id, advance=chunk_packet.length)
+
             elif packet.flag == Flag.DONE:
                 logging.info('[Sender] All files are processed, exit.')
                 break
+
             else:
                 logging.error(f'[Sender] Unknow packet: {packet}')
 

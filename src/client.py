@@ -231,7 +231,8 @@ class Client:
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
+        logging.debug(f'[bold cyan]fcp[/bold cyan]: '
+                      f'Channel {channel.get_name()} connected')
 
         return session_id
 
@@ -247,7 +248,8 @@ class Client:
             for channel in channels:
                 send_pkt(channel, attach_pkt)
                 porter.conn_pool.add(channel)
-                logging.debug(f'[cyan]fcp[/cyan]: Channel {channel.get_name()} connected')
+                logging.debug(f'[bold cyan]fcp[/bold cyan]: '
+                              f'Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
             Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
@@ -256,7 +258,7 @@ class Client:
         '''主函数'''
         try:
             progress.start()
-            print('[cyan]fcp[/cyan]: connecting to server ...')
+            print('[bold cyan]fcp[/bold cyan]: connecting to server ...')
             channels, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
@@ -267,23 +269,23 @@ class Client:
                 }, ensure_ascii=False, separators=(',', ':'))
                 session_id = self.handshake(channels[0], remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
-                print('[cyan]fcp[/cyan]: receiving files ...')
+                print('[bold cyan]fcp[/bold cyan]: receiving files ...')
             else:
                 session_id = self.handshake(channels[0], self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
-                print('[cyan]fcp[/cyan]: sending files ...')
+                print('[bold cyan]fcp[/bold cyan]: sending files ...')
 
             porter.start()
             for chan in channels:
                 porter.conn_pool.add(chan)
             self.attched_connect(porter, session_id, pkey, password)
             porter.join()
-            print('[cyan]fcp[/cyan]: finished.')
+            print('[bold cyan]fcp[/bold cyan]: '
+                  '[bold green]finished![/bold green]')
         except Exception as e:
-            from traceback import print_exc
-            logging.error(f'[cyan]fcp[/cyan]: {e}, exit.')
-            print_exc()
+            logging.error(f'[bold cyan]fcp[/bold cyan]: {e}, exit.')
+            progress.console.print_exception()
             sys.exit(1)
         finally:
             progress.stop()
@@ -291,7 +293,7 @@ class Client:
 
 def handle_sigint(signum, frame):
     '''键盘中断事件的处理'''
-    logging.error('[cyan]fcp[/cyan]: user canceled.')
+    logging.error('[bold cyan]fcp[/bold cyan]: user canceled.')
     progress.stop()
     sys.exit(1)
 
