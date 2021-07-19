@@ -1,10 +1,28 @@
-.DS_Store
-test/*
-
-.venv/*
-*.pyc
+# Byte-compiled / optimized / DLL files
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+__pypackages__/
+
+# Environments
+.venv
+.python-version
+
+# mypy
+.mypy_cache/
 
 # VSCode
 .vscode/
 *.code-workspace
+
+# others
+.DS_Store
+test/*

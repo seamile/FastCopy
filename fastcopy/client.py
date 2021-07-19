@@ -4,6 +4,7 @@ import os
 import sys
 import logging
 import paramiko
+import signal
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
 from json import dumps
@@ -13,16 +14,17 @@ from textwrap import dedent
 from threading import Thread
 from time import sleep
 from typing import List
+from functools import partial
 
-from utils import Flag, SERVER_ADDR, TIMEOUT
-from utils import Packet, send_msg, recv_msg
-from utils import Sender, Receiver
+from .utils import Flag, SERVER_ADDR, TIMEOUT
+from .utils import Packet, send_pkt, recv_pkt
+from .utils import Sender, Receiver, progress
 
 
 class Client:
-    ssh_default_port = 22
-    ssh_default_dir = os.path.expanduser('~/.ssh')
-    ssh_config_file = os.path.join(ssh_default_dir, 'config')
+    default_port = 22
+    default_dir = os.path.expanduser('~/.ssh')
+    default_config = os.path.join(default_dir, 'config')
 
     def __init__(self, cli_parser: ArgumentParser):
         args = cli_parser.parse_args()
@@ -49,7 +51,7 @@ class Client:
         self.exclude = [p for p in args.exclude.split(',') if p]
 
         # the ssh tunnels
-        # inside: [(paramiko.Transport, paramiko.Channel), (...), ...]
+        # inside: [(paramiko.Transport, paramiko.Channel, ...), ...]
         self.tunnels: List = []
 
     @staticmethod
@@ -88,6 +90,9 @@ class Client:
 
     def set_log(self, verbose_mode):
         '''处理日志'''
+        global print
+        print = partial(progress.print, style='blue')
+
         log_level = {
             0: logging.ERROR,
             1: logging.WARNING,
@@ -95,19 +100,27 @@ class Client:
             3: logging.DEBUG
         }.get(verbose_mode, logging.ERROR)
 
-        logging.basicConfig(level=log_level, format='%(message)s')
+        if log_level <= logging.ERROR:
+            logging.error = partial(progress.print, style='red')
+        if log_level <= logging.WARNING:
+            logging.warning = partial(progress.print, style='yellow')
+        if log_level <= logging.INFO:
+            print = partial(progress.print, style='blue')
+        if log_level <= logging.DEBUG:
+            logging.debug = partial(progress.print, style='white')
+
         paramiko_logger = logging.getLogger("paramiko")
         paramiko_logger.setLevel(logging.ERROR)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
         '''加载默认配置'''
-        _path = user_config_file or cls.ssh_config_file
+        _path = user_config_file or cls.default_config
         cfg = paramiko.SSHConfig.from_path(_path)
         return cfg.lookup(hostname)
 
     @staticmethod
-    def load_key(key_path):
+    def load_pkey(key_path):
         '''加载 Key'''
         _path = os.path.abspath(os.path.expanduser(key_path))
         if not os.path.isfile(_path):
@@ -131,6 +144,23 @@ class Client:
                     password = getpass(f"Enter password for key '{key_path}': ")
                 except paramiko.SSHException:
                     continue
+
+    def search_pkeys(self):
+        '''查找可用的私钥'''
+        if self.pkey_path:
+            pkey_paths = [self.pkey_path]
+        else:
+            pkey_paths = self.config.get('identityfile', [])
+
+        if not pkey_paths:
+            for keyname in os.listdir(self.default_dir):
+                if keyname.startswith('id_') and not keyname.endswith('.pub'):
+                    path = os.path.join(self.default_dir, keyname)
+                    pkey_paths.append(path)
+
+        logging.debug(f'found pkeys: {pkey_paths}')
+
+        return pkey_paths
 
     def new_channel_name(self):
         '''产生一个新的 Channel 名'''
@@ -166,22 +196,12 @@ class Client:
         '''连接服务器'''
         # 获取 SSH 服务器的连接参数
         self.host = self.config.get('hostname', self.host)
-        self.port = self.port or self.config.get('port') or self.ssh_default_port
+        self.port = self.port or self.config.get('port') or self.default_port
         self.username = self.username or self.config.get('user') or getuser()
         logging.debug(f'login info: {self.username}@{self.host}:{self.port}')
 
         # search private keys
-        if self.pkey_path:
-            pkey_paths = [self.pkey_path]
-        else:
-            pkey_paths = self.config.get('identityfile', [])
-
-        if not pkey_paths:
-            for filename in os.listdir(self.ssh_default_dir):
-                if filename.startswith('id_') and not filename.endswith('.pub'):
-                    path = os.path.join(self.ssh_default_dir, filename)
-                    pkey_paths.append(path)
-        logging.debug(f'found pkeys: {pkey_paths}')
+        pkey_paths = self.search_pkeys()
 
         # connect to ssh server (just connect, not auth)
         addr = (self.host, self.port)
@@ -190,30 +210,29 @@ class Client:
         # try the pkeys one by one
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
-            pkey = self.load_key(_path)
-            channels = self.new_channel(sock, self.username, pkey, None)
+            pkey = self.load_pkey(_path)
+            channels = self.new_channel(sock, self.username, pkey, None, 1)
             if channels:
-                return channels[0], pkey, None
+                return channels, pkey, None
 
         # try to auth with password
         for _ in range(3):
             password = getpass(f'password for {self.username}@{self.host}: ')
-            channels = self.new_channel(sock, self.username, None, password)
+            channels = self.new_channel(sock, self.username, None, password, 1)
             if channels:
-                return channels[0], None, password
+                return channels, None, password
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
 
-    def handshake(self, remote_path: str):
+    def handshake(self, channel, remote_path: str):
         '''握手'''
-        logging.info('[Client] Handshaking...')
-        channel = self.tunnels[0][1]
         conn_pkt = Packet.load(self.action, remote_path)
-        send_msg(channel, conn_pkt)
-        session_pkt = recv_msg(channel)
+        send_pkt(channel, conn_pkt)
+        session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'[Client] Channel {channel.get_name()} connected')
+        logging.debug(f'[bold cyan]fcp[/bold cyan]: '
+                      f'Channel {channel.get_name()} connected')
 
         return session_id
 
@@ -225,11 +244,12 @@ class Client:
         def _connect(wait):
             sleep(wait)
             sock = create_connection(addr)
-            channels = self.new_channel(sock, self.username, pkey, password, 3)
+            channels = self.new_channel(sock, self.username, pkey, password, 4)
             for channel in channels:
-                send_msg(channel, attach_pkt)
+                send_pkt(channel, attach_pkt)
                 porter.conn_pool.add(channel)
-                logging.info(f'[Client] Channel {channel.get_name()} connected')
+                logging.debug(f'[bold cyan]fcp[/bold cyan]: '
+                              f'Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
             Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
@@ -237,8 +257,9 @@ class Client:
     def start(self):
         '''主函数'''
         try:
-            logging.info('[Client] Connecting to server...')
-            channel, pkey, password = self.first_connect()
+            progress.start()
+            print('[bold cyan]fcp[/bold cyan]: connecting to server ...')
+            channels, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
                 remote_path = dumps({
@@ -246,25 +267,41 @@ class Client:
                     'include': self.include,
                     'exclude': self.exclude
                 }, ensure_ascii=False, separators=(',', ':'))
-                session_id = self.handshake(remote_path)
+                session_id = self.handshake(channels[0], remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
+                print('[bold cyan]fcp[/bold cyan]: receiving files ...')
             else:
-                session_id = self.handshake(self.dst)
+                session_id = self.handshake(channels[0], self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
+                print('[bold cyan]fcp[/bold cyan]: sending files ...')
 
             porter.start()
-            porter.conn_pool.add(channel)
+            for chan in channels:
+                porter.conn_pool.add(chan)
             self.attched_connect(porter, session_id, pkey, password)
             porter.join()
+            print('[bold cyan]fcp[/bold cyan]: '
+                  '[bold green]finished![/bold green]')
         except Exception as e:
-            from traceback import print_exc
-            logging.error(f'[Client] {e}, exit.')
-            print_exc()
+            logging.error(f'[bold cyan]fcp[/bold cyan]: {e}, exit.')
+            progress.console.print_exception()
             sys.exit(1)
+        finally:
+            progress.stop()
 
 
-if __name__ == '__main__':
+def handle_sigint(signum, frame):
+    '''键盘中断事件的处理'''
+    logging.error('[bold cyan]fcp[/bold cyan]: user canceled.')
+    progress.stop()
+    sys.exit(1)
+
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+
+def main():
     parser = ArgumentParser(
         prog='fcp',
         formatter_class=RawDescriptionHelpFormatter,
@@ -283,7 +320,7 @@ if __name__ == '__main__':
     parser.add_argument('-F', dest='ssh_config', type=str, default=None,
                         help='The config file for SSH (default: ~/.ssh/config)')
 
-    parser.add_argument('-n', dest='num', type=int, default=16,
+    parser.add_argument('-n', dest='num', type=int, default=8,
                         help='Max number of connections (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
@@ -300,3 +337,7 @@ if __name__ == '__main__':
 
     cli = Client(parser)
     cli.start()
+
+
+if __name__ == '__main__':
+    main()
