@@ -2,6 +2,30 @@
 
 远程文件快速复制、同步工具。
 
+## 安装
+
+```shell
+pip install fast-copy
+```
+
+## 使用
+
+1. 服务器
+
+    ```shell
+    fcpd -d
+    ```
+
+2. 本地
+    
+    ```shell
+    # download
+    fcp user@host:/foo/bar ./
+    
+    # upload
+    fcp ./fake/file user@host:/foo/bar
+    ```
+
 ## 报文设计
 
 所有数据包均采用**大端字节序**
