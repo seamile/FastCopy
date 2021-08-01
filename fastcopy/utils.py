@@ -450,9 +450,13 @@ class FileInfo:
         with open(self.abspath, 'rb') as fp:
             seq = 0
             # 读取单位长度的数据，如果为空则跳出循环
-            while chunk := fp.read(CHUNK_SIZE):
-                yield Packet.load(Flag.FILE_CHUNK, self.id, seq, chunk)
-                seq += 1
+            while True:
+                chunk = fp.read(CHUNK_SIZE)
+                if chunk:
+                    yield Packet.load(Flag.FILE_CHUNK, self.id, seq, chunk)
+                    seq += 1
+                else:
+                    break
 
     def iwrite(self) -> Generator[None, Tuple[int, bytes], None]:
         '''按数据块迭代写入'''
@@ -476,8 +480,12 @@ class FileInfo:
     def hash(filepath: Path) -> bytes:
         hasher = md5()
         with open(filepath, 'rb') as fp:
-            while chunk := fp.read(CHUNK_SIZE):
-                hasher.update(chunk)
+            while True:
+                chunk = fp.read(CHUNK_SIZE)
+                if chunk:
+                    hasher.update(chunk)
+                else:
+                    break
         return hasher.digest()
 
     def is_vaild(self):

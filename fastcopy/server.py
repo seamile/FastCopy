@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 
+import _socket
 import logging
 from argparse import ArgumentParser
 from json import loads
-from socket import socket, create_server, timeout as TimeoutError
+from socket import socket
+from socket import error as SocketError, timeout as TimeoutError
+from socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, SO_REUSEPORT
 from threading import Lock, Thread
 from typing import Dict
 from uuid import uuid4
@@ -90,8 +93,43 @@ class Server(Thread):
         for porter in self.porters.values():
             porter.close()
 
+    @staticmethod
+    def create_socket_server(address, *, family=AF_INET, backlog=None,
+                             reuse_port=False):
+        """copyed from socket.py"""
+        if reuse_port and not hasattr(_socket, "SO_REUSEPORT"):
+            raise ValueError("SO_REUSEPORT not supported on this platform")
+
+        sock = socket(family, SOCK_STREAM)
+        try:
+            if hasattr(_socket, 'SO_REUSEADDR'):
+                try:
+                    sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+                except SocketError:
+                    # Fail later on bind(), for platforms which may not
+                    # support this option.
+                    pass
+            if reuse_port:
+                sock.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)
+            try:
+                sock.bind(address)
+            except SocketError as err:
+                msg = '%s (while attempting to bind on address %r)' % \
+                    (err.strerror, address)
+                raise SocketError(err.errno, msg) from None
+            if backlog is None:
+                sock.listen()
+            else:
+                sock.listen(backlog)
+            return sock
+        except SocketError:
+            sock.close()
+            raise
+
     def run(self):
-        self.srv_sock = create_server(self.addr, backlog=2048, reuse_port=True)
+        self.srv_sock = self.create_socket_server(self.addr,
+                                                  backlog=2048,
+                                                  reuse_port=True)
         logging.info('[Server] Listening to %s:%d' % self.addr)
         while self.is_running:
             # wait for new connection
