@@ -105,10 +105,11 @@ class Client:
         if log_level <= logging.WARNING:
             logging.warning = partial(progress.print, style='yellow')
         if log_level <= logging.INFO:
-            print = partial(progress.print, style='blue')
+            logging.info = partial(progress.print, style='blue')
         if log_level <= logging.DEBUG:
             logging.debug = partial(progress.print, style='white')
 
+        print = partial(progress.print, style='blue')
         paramiko_logger = logging.getLogger("paramiko")
         paramiko_logger.setLevel(logging.ERROR)
 
@@ -258,7 +259,7 @@ class Client:
         '''主函数'''
         try:
             progress.start()
-            print('[bold cyan]fcp[/bold cyan]: connecting to server ...')
+            print('[bold cyan]fcp[/bold cyan]: connecting to server')
             channels, pkey, password = self.first_connect()
 
             if self.action == Flag.PULL:
@@ -269,12 +270,12 @@ class Client:
                 }, ensure_ascii=False, separators=(',', ':'))
                 session_id = self.handshake(channels[0], remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
-                print('[bold cyan]fcp[/bold cyan]: receiving files ...')
+                print('[bold cyan]fcp[/bold cyan]: receiving files')
             else:
                 session_id = self.handshake(channels[0], self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
-                print('[bold cyan]fcp[/bold cyan]: sending files ...')
+                print('[bold cyan]fcp[/bold cyan]: sending files')
 
             porter.start()
             for chan in channels:

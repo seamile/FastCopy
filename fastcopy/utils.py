@@ -204,7 +204,7 @@ class PacketError(Exception):
 def send_pkt(conn: Union[socket, Channel], packet: Packet):
     '''发送数据报文'''
     datagram = packet.pack()
-    conn.send(datagram)
+    conn.sendall(datagram)
 
 
 def recv_all(conn: Union[socket, Channel], length: int) -> bytes:
@@ -248,8 +248,8 @@ class ConnectionPool(Thread):
     def __init__(self, size=16):
         super().__init__(daemon=True)
         self.size = min(size, self._max_size)
-        self.send_q = Queue()
-        self.recv_q = Queue()
+        self.send_q = Queue(self.size * 16)
+        self.recv_q = Queue(self.size * 16)
         self.done = Event()
         self.connections = {}
 
@@ -291,7 +291,8 @@ class ConnectionPool(Thread):
                     seqs = ','.join(f'{k}' for k in cache.keys())
                     logging.error(f"{seq} not in {seqs}")
                     sys.exit(1)
-                pkt = cache.pop(seq)
+                pkt = cache[seq]
+                print(f'get {seq} from {id(cache)}')
                 self.send(pkt)
             else:
                 logging.debug(f'[Recv] conn-{conn_name}/{cache.cur_seq}: {packet}')
