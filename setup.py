@@ -4,8 +4,8 @@ with open("README.md", "r") as f_readme:
     long_description = f_readme.read()
 
 setuptools.setup(
-    name="fast-copy",
-    version="0.1.1",
+    name="fastcopy",
+    version="0.1.3",
     python_requires=">=3.6",
     author="Seamile",
     author_email="lanhuermao@gmail.com",

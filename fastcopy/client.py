@@ -177,9 +177,10 @@ class Client:
             tp.use_compression(True)
             tp.set_keepalive(60)
             tp.connect(username=user, pkey=pkey, password=password)
-        except paramiko.SSHException:
+        except paramiko.SSHException as e:
+            logging.error(e)
             tp.stop_thread()
-            return
+            return []
 
         try:
             conns = [tp]
@@ -232,8 +233,8 @@ class Client:
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.debug(f'[bold cyan]fcp[/bold cyan]: '
-                      f'Channel {channel.get_name()} connected')
+        logging.info(f'[bold cyan]fcp[/bold cyan]: '
+                     f'Channel {channel.get_name()} connected')
 
         return session_id
 
@@ -249,8 +250,8 @@ class Client:
             for channel in channels:
                 send_pkt(channel, attach_pkt)
                 porter.conn_pool.add(channel)
-                logging.debug(f'[bold cyan]fcp[/bold cyan]: '
-                              f'Channel {channel.get_name()} connected')
+                logging.info(f'[bold cyan]fcp[/bold cyan]: '
+                             f'Channel {channel.get_name()} connected')
 
         for i in range(self.n_channel - 1):
             Thread(target=_connect, args=(0.5 * i,), daemon=True).start()

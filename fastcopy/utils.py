@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import logging
 from binascii import crc32
 from collections import deque
@@ -14,7 +13,7 @@ from queue import Queue, Empty
 from socket import socket, MSG_WAITALL, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
-from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
+from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple, Set,
                     Tuple, Union)
 
 from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
@@ -22,7 +21,7 @@ from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-CHUNK_SIZE = 8192  # 默认数据块大小 (单位: 字节)
+CHUNK_SIZE = 1024 * 16  # 默认数据块大小 (单位: 字节)
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 MAX_SEQ = 0xffffffff
@@ -55,28 +54,6 @@ class Flag(IntEnum):
     @classmethod
     def contains(cls, member: object) -> bool:
         return member in cls.__members__.values()
-
-
-class DictQueue(dict):
-    def __init__(self, size=None):
-        super().__init__()
-        self.size = size or float('inf')
-        self.cur_seq = 0
-
-    def put(self, value):
-        while len(self) >= self.size:
-            self.pop()
-
-        self[self.cur_seq] = value
-        logging.debug(f'[DictQueue] put {self.cur_seq} to {value} into {id(self)}')
-        self.cur_seq = (self.cur_seq + 1) & MAX_SEQ
-
-    def pop(self, seq=None):
-        if seq is None:
-            seq = min(self.keys())
-        value = super().pop(seq)
-        logging.debug(f'[DictQueue] pop {seq} as {value} from {id(self)}')
-        return value
 
 
 class Packet(NamedTuple):
@@ -251,7 +228,7 @@ class ConnectionPool(Thread):
         self.send_q = Queue(self.size * 16)
         self.recv_q = Queue(self.size * 16)
         self.done = Event()
-        self.connections = {}
+        self.connections: Set[socket] = set()
 
     def send(self, packet: Packet):
         self.send_q.put(packet)
@@ -259,45 +236,31 @@ class ConnectionPool(Thread):
     def recv(self, timeout=TIMEOUT) -> Packet:
         return self.recv_q.get(timeout)
 
-    def _send(self, conn: socket, cache: DictQueue):
+    def _send(self, conn: socket):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             packet: Packet = self.send_q.get()
             try:
                 send_pkt(conn, packet)
             except SocketError as e:
-                logging.error(e)
-                sys.exit(1)
+                conn.close()
+                logging.error(f'[Send] conn-{conn_name}: {e}, conn exit.')
+                return
 
-            logging.debug(f'[Send] conn-{conn_name}/{cache.cur_seq}: {packet}')
-            cache.put(packet)
-
-    def _recv(self, conn: socket, cache: DictQueue):
-        n_recv = 0
+    def _recv(self, conn: socket):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             try:
                 packet = recv_pkt(conn)
-            except ConnectionResetError:
-                return
-            except PacketError:
-                resend_pkt = Packet.load(Flag.RESEND, n_recv)
-                send_pkt(conn, resend_pkt)
-                continue
-
-            if packet.flag is Flag.RESEND:
-                seq, = packet.unpack_body()
-                if seq not in cache:
-                    seqs = ','.join(f'{k}' for k in cache.keys())
-                    logging.error(f"{seq} not in {seqs}")
-                    sys.exit(1)
-                pkt = cache[seq]
-                print(f'get {seq} from {id(cache)}')
-                self.send(pkt)
-            else:
-                logging.debug(f'[Recv] conn-{conn_name}/{cache.cur_seq}: {packet}')
                 self.recv_q.put(packet)
-                n_recv = (n_recv + 1) & MAX_SEQ
+                logging.debug(f'[Recv] conn-{conn_name}: {packet}')
+            except ConnectionResetError:
+                conn.close()
+                return
+            except PacketError as e:
+                conn.close()
+                logging.error(f'[Recv] conn-{conn_name}: {e}, conn exit.')
+                return
 
     def add(self, conn: socket):
         '''添加一个连接'''
@@ -308,12 +271,17 @@ class ConnectionPool(Thread):
         if conn in self.connections:
             return True
 
-        cache = DictQueue(256)
-        t_send = Thread(target=self._send, args=(conn, cache), daemon=True)
+        t_send = Thread(target=self._send, args=(conn,), daemon=True)
         t_send.start()
 
-        t_recv = Thread(target=self._recv, args=(conn, cache), daemon=True)
+        t_recv = Thread(target=self._recv, args=(conn,), daemon=True)
         t_recv.start()
+        return True
+
+    def all_closed(self):
+        for conn in self.connections:
+            if not conn.closed:
+                return False
         return True
 
     def stop(self):
@@ -323,7 +291,11 @@ class ConnectionPool(Thread):
 
     def run(self):
         self.done.clear()
-        self.done.wait()
+        while not self.done.wait(1):
+            if not self.connections:
+                continue
+            elif self.all_closed():
+                break
         self.stop()
 
 
