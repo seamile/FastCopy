@@ -278,10 +278,10 @@ class Client:
                                 self.include, self.exclude)
                 print('[bold cyan]fcp[/bold cyan]: sending files')
 
-            porter.start()
             for chan in channels:
                 porter.conn_pool.add(chan)
             self.attched_connect(porter, session_id, pkey, password)
+            porter.start()
             porter.join()
             print('[bold cyan]fcp[/bold cyan]: '
                   '[bold green]finished![/bold green]')

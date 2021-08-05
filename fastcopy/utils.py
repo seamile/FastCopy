@@ -10,7 +10,7 @@ from math import ceil
 from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
-from socket import socket, MSG_WAITALL, error as SocketError
+from socket import socket, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
 from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple, Set,
@@ -26,6 +26,7 @@ TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 MAX_SEQ = 0xffffffff
 
+Connection = Union[socket, Channel]
 
 progress = Progress(
     TextColumn("[bold blue]{task.fields[filename]}"),
@@ -178,45 +179,39 @@ class PacketError(Exception):
     pass
 
 
-def send_pkt(conn: Union[socket, Channel], packet: Packet):
+def send_pkt(conn: Connection, packet: Packet):
     '''发送数据报文'''
     datagram = packet.pack()
     conn.sendall(datagram)
 
 
-def recv_all(conn: Union[socket, Channel], length: int) -> bytes:
-    if isinstance(conn, socket):
-        return conn.recv(length, MSG_WAITALL)
-    else:
-        datagram = bytearray()
-        while length > 0:
-            _data = conn.recv(length)
-            n_recv = len(_data)
-            if n_recv > 0:
-                length -= n_recv
-                datagram.extend(_data)
-            else:
-                return _data
-        return bytes(datagram)
+def recv_all(conn: Connection, length: int) -> bytes:
+    '''接受完整数据'''
+    datagram = bytearray()
+    while length > 0:
+        _data = conn.recv(length)
+        n_recv = len(_data)
+        if n_recv > 0:
+            length -= n_recv
+            datagram += _data
+        else:
+            raise ConnectionResetError
+
+    return bytes(datagram)
 
 
-def recv_pkt(conn: Union[socket, Channel]) -> Packet:
+def recv_pkt(conn: Connection) -> Packet:
     '''接收数据报文'''
     # 接收并解析 head 部分
     head = recv_all(conn, LEN_HEAD)
-    if not head:
-        raise ConnectionResetError
-    else:
-        flag, chksum, len_body = Packet.unpack_head(head)
+    flag, chksum, len_body = Packet.unpack_head(head)
 
     # 接收 body 部分
     body = recv_all(conn, len_body)
-    if not body:
-        raise ConnectionResetError
-    elif crc32(body) != chksum:
-        raise PacketError  # 错误重传
-    else:
+    if crc32(body) == chksum:
         return Packet(flag, body)
+    else:
+        raise PacketError
 
 
 class ConnectionPool(Thread):
@@ -228,7 +223,7 @@ class ConnectionPool(Thread):
         self.send_q = Queue(self.size * 16)
         self.recv_q = Queue(self.size * 16)
         self.done = Event()
-        self.connections: Set[socket] = set()
+        self.connections: Set[Connection] = set()
 
     def send(self, packet: Packet):
         self.send_q.put(packet)
@@ -236,7 +231,7 @@ class ConnectionPool(Thread):
     def recv(self, timeout=TIMEOUT) -> Packet:
         return self.recv_q.get(timeout)
 
-    def _send(self, conn: socket):
+    def _send(self, conn: Connection):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             packet: Packet = self.send_q.get()
@@ -247,7 +242,7 @@ class ConnectionPool(Thread):
                 logging.error(f'[Send] conn-{conn_name}: {e}, conn exit.')
                 return
 
-    def _recv(self, conn: socket):
+    def _recv(self, conn: Connection):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             try:
@@ -257,12 +252,15 @@ class ConnectionPool(Thread):
             except ConnectionResetError:
                 conn.close()
                 return
-            except PacketError as e:
+            except SocketError as e:
                 conn.close()
                 logging.error(f'[Recv] conn-{conn_name}: {e}, conn exit.')
+            except PacketError:
+                conn.close()
+                logging.error(f'conn-{conn_name} received an error packet.')
                 return
 
-    def add(self, conn: socket):
+    def add(self, conn: Connection):
         '''添加一个连接'''
         # 检查数量是否达到上限
         if len(self.connections) >= self._max_size:
@@ -278,6 +276,14 @@ class ConnectionPool(Thread):
         t_recv.start()
         return True
 
+    def pop(self, conn: Connection):
+        try:
+            self.connections.remove(conn)
+        except KeyError:
+            pass
+        finally:
+            conn.close()
+
     def all_closed(self):
         for conn in self.connections:
             if not conn.closed:
@@ -290,11 +296,14 @@ class ConnectionPool(Thread):
             conn.close()
 
     def run(self):
+        if not self.connections:
+            raise ValueError('No connection')
+
         self.done.clear()
-        while not self.done.wait(1):
+        while True:
             if not self.connections:
-                continue
-            elif self.all_closed():
+                break
+            if self.done.wait(1):
                 break
         self.stop()
 

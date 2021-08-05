@@ -150,6 +150,7 @@ pip install fast-copy
 
 ## TODO
 
+- 结束信号不准确，无法正常退出
 - Server 执行中的错误需要反馈到 Client
 - 服务器异常退出前，给客户端发送异常原因
 - 断点续传支持
