@@ -32,9 +32,12 @@ class WatchDog(Thread):
             self.sock.settimeout(60)
             packet = recv_pkt(self.sock)
             self.sock.settimeout(None)
+        except ConnectionResetError:
+            logging.error('[WatchDog] connection reset by peer.')
+            return
         except TimeoutError:
             # 超时退出
-            logging.debug('[WatchDog] handshake timeout, exit.')
+            logging.error('[WatchDog] handshake timeout.')
             self.sock.close()
             return
 

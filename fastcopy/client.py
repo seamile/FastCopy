@@ -3,7 +3,6 @@
 import os
 import sys
 import logging
-import paramiko
 import signal
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from getpass import getpass, getuser
@@ -12,12 +11,15 @@ from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
 from threading import Thread
-from time import sleep
-from typing import List
+from typing import Any, Dict, List, Tuple
 from functools import partial
 
-from .utils import Flag, SERVER_ADDR, TIMEOUT
-from .utils import Packet, send_pkt, recv_pkt
+from paramiko import Channel, Transport, SSHConfig
+from paramiko import RSAKey, DSSKey, ECDSAKey, Ed25519Key
+from paramiko import SSHException, ChannelException, PasswordRequiredException
+
+from .utils import SERVER_ADDR, SSH_MUX, TIMEOUT
+from .utils import Flag, Packet, send_pkt, recv_pkt
 from .utils import Sender, Receiver, progress
 
 
@@ -44,15 +46,15 @@ class Client:
             sys.exit(1)
 
         self.config = self.load_ssh_config(self.host, args.ssh_config)
-        self.n_channel = args.num
+        self.n_tunnel = args.num
+        self.n_channel = self.n_tunnel * SSH_MUX
         self.port = args.port
         self.pkey_path = args.private_key
         self.include = args.include
         self.exclude = [p for p in args.exclude.split(',') if p]
 
         # the ssh tunnels
-        # inside: [(paramiko.Transport, paramiko.Channel, ...), ...]
-        self.tunnels: List = []
+        self.tunnels: Dict[Transport, List[Channel]] = {}
 
     @staticmethod
     def parse_remote_addr(remote):
@@ -117,7 +119,7 @@ class Client:
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
         '''加载默认配置'''
         _path = user_config_file or cls.default_config
-        cfg = paramiko.SSHConfig.from_path(_path)
+        cfg = SSHConfig.from_path(_path)
         return cfg.lookup(hostname)
 
     @staticmethod
@@ -131,19 +133,23 @@ class Client:
         filename = os.path.basename(_path)
         key_type = filename.split('_')[1] if filename.startswith('id_') else ''
         key_types = ['rsa', 'ed25519', 'dsa', 'ecdsa']
-        key_classes = {'rsa': paramiko.RSAKey, 'ed25519': paramiko.Ed25519Key,
-                       'dsa': paramiko.DSSKey, 'ecdsa': paramiko.ECDSAKey}
+        key_classes = {
+            'rsa': RSAKey,
+            'ed25519': Ed25519Key,
+            'dsa': DSSKey,
+            'ecdsa': ECDSAKey
+        }
 
         types_to_try = [key_type] if key_type in key_types else key_types
-        for i in range(3):
+        for _ in range(3):
             password = None
             for _type in types_to_try:
                 key_cls = key_classes[_type]
                 try:
                     return key_cls.from_private_key_file(key_path, password)
-                except paramiko.PasswordRequiredException:
+                except PasswordRequiredException:
                     password = getpass(f"Enter password for key '{key_path}': ")
-                except paramiko.SSHException:
+                except SSHException:
                     continue
 
     def search_pkeys(self):
@@ -163,42 +169,36 @@ class Client:
 
         return pkey_paths
 
-    def new_channel_name(self):
-        '''产生一个新的 Channel 名'''
-        if not hasattr(self, '_chanid'):
-            self._chanid = 0
-        self._chanid += 1
-        return f'{self._chanid:03d}'
-
-    def new_channel(self, sock, user, pkey, password, num=1):
-        '''create a new Channel'''
+    @staticmethod
+    def create_transport(sock, user, pkey, password):
+        tp = Transport(sock)
+        tp.use_compression(True)
+        tp.set_keepalive(60)
         try:
-            tp = paramiko.Transport(sock)
-            tp.use_compression(True)
-            tp.set_keepalive(60)
             tp.connect(username=user, pkey=pkey, password=password)
-        except paramiko.SSHException as e:
-            logging.error(e)
+            if tp.is_authenticated():
+                return tp
+        except SSHException as e:
             tp.stop_thread()
-            return []
+            logging.error(e)
 
+    @staticmethod
+    def create_channel(transport: Transport) -> Channel:
         try:
-            conns = [tp]
-            for _ in range(num):
-                channel = tp.open_channel('direct-tcpip', SERVER_ADDR, ('localhost', 0))
-                channel.settimeout(TIMEOUT)
-                channel.set_name(self.new_channel_name())
-                conns.append(channel)
-            self.tunnels.append(conns)
-            return conns[1:]
-        except paramiko.ChannelException:
+            channel = transport.open_channel(kind='direct-tcpip',
+                                             dest_addr=SERVER_ADDR,
+                                             src_addr=('localhost', 0))
+            channel.settimeout(TIMEOUT)
+            return channel
+        except ChannelException:
             sys.exit(1)
 
-    def first_connect(self):
-        '''连接服务器'''
+    def ssh_connect(self) -> Tuple[Transport, Any, Any]:  # type: ignore
+        '''连接 SSH 服务器'''
         # 获取 SSH 服务器的连接参数
         self.host = self.config.get('hostname', self.host)
         self.port = self.port or self.config.get('port') or self.default_port
+        self.port = int(self.port)
         self.username = self.username or self.config.get('user') or getuser()
         logging.debug(f'login info: {self.username}@{self.host}:{self.port}')
 
@@ -213,16 +213,18 @@ class Client:
         for _path in pkey_paths:
             logging.debug(f'test pkey: {_path}')
             pkey = self.load_pkey(_path)
-            channels = self.new_channel(sock, self.username, pkey, None, 1)
-            if channels:
-                return channels, pkey, None
+            tp = self.create_transport(sock, self.username, pkey, None)
+            if tp:
+                self.tunnels[tp] = []
+                return tp, pkey, None
 
         # try to auth with password
         for _ in range(3):
             password = getpass(f'password for {self.username}@{self.host}: ')
-            channels = self.new_channel(sock, self.username, None, password, 1)
-            if channels:
-                return channels, None, password
+            tp = self.create_transport(sock, self.username, None, password)
+            if tp:
+                self.tunnels[tp] = []
+                return tp, None, password
 
         logging.error('Failed to create SSH tunnel')
         sys.exit(1)
@@ -233,35 +235,37 @@ class Client:
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'[bold cyan]fcp[/bold cyan]: '
+        logging.info(f'[cyan]fcp[/cyan]: '
                      f'Channel {channel.get_name()} connected')
 
         return session_id
 
-    def attched_connect(self, porter, session_id, pkey, password):
+    def attached_connect(self, conn_pool, session_id, pkey, password):
         '''后续连接'''
         addr = (self.host, self.port)
         attach_pkt = Packet.load(Flag.ATTACH, session_id)
 
-        def _connect(wait):
-            sleep(wait)
-            sock = create_connection(addr)
-            channels = self.new_channel(sock, self.username, pkey, password, 4)
-            for channel in channels:
+        # create transports
+        for _ in range(self.n_tunnel - len(self.tunnels)):
+            tp = self.create_transport(addr, self.username, pkey, password)
+            self.tunnels[tp] = []
+
+        # create channels
+        for tp, channels in self.tunnels.items():
+            for _ in range(SSH_MUX - len(channels)):
+                channel = self.create_channel(tp)
                 send_pkt(channel, attach_pkt)
-                porter.conn_pool.add(channel)
-                logging.info(f'[bold cyan]fcp[/bold cyan]: '
+                channels.append(channel)
+                conn_pool.add(channel)
+                logging.info(f'[cyan]fcp[/cyan]: '
                              f'Channel {channel.get_name()} connected')
 
-        for i in range(self.n_channel - 1):
-            Thread(target=_connect, args=(0.5 * i,), daemon=True).start()
-
     def start(self):
-        '''主函数'''
         try:
             progress.start()
-            print('[bold cyan]fcp[/bold cyan]: connecting to server')
-            channels, pkey, password = self.first_connect()
+            print('[cyan]fcp[/cyan]: connecting to server')
+            tp, pkey, password = self.ssh_connect()
+            first_channel = self.create_channel(tp)
 
             if self.action == Flag.PULL:
                 remote_path = dumps({
@@ -269,24 +273,27 @@ class Client:
                     'include': self.include,
                     'exclude': self.exclude
                 }, ensure_ascii=False, separators=(',', ':'))
-                session_id = self.handshake(channels[0], remote_path)
+                session_id = self.handshake(first_channel, remote_path)
                 porter = Receiver(session_id, self.dst, self.n_channel)
-                print('[bold cyan]fcp[/bold cyan]: receiving files')
+                print('[cyan]fcp[/cyan]: receiving files')
             else:
-                session_id = self.handshake(channels[0], self.dst)
+                session_id = self.handshake(first_channel, self.dst)
                 porter = Sender(session_id, self.srcs, self.n_channel,
                                 self.include, self.exclude)
-                print('[bold cyan]fcp[/bold cyan]: sending files')
+                print('[cyan]fcp[/cyan]: sending files')
 
-            for chan in channels:
-                porter.conn_pool.add(chan)
-            self.attched_connect(porter, session_id, pkey, password)
+            porter.conn_pool.add(first_channel)
             porter.start()
+
+            # create attached connections
+            t = Thread(target=self.attached_connect,
+                       args=(porter.conn_pool, session_id, pkey, password))
+            t.start()
+
             porter.join()
-            print('[bold cyan]fcp[/bold cyan]: '
-                  '[bold green]finished![/bold green]')
+            print('[cyan]fcp[/cyan]: [bold green]finished![/bold green]')
         except Exception as e:
-            logging.error(f'[bold cyan]fcp[/bold cyan]: {e}, exit.')
+            logging.error(f'[cyan]fcp[/cyan]: {e}, exit.')
             progress.console.print_exception()
             sys.exit(1)
         finally:
@@ -295,7 +302,7 @@ class Client:
 
 def handle_sigint(signum, frame):
     '''键盘中断事件的处理'''
-    logging.error('[bold cyan]fcp[/bold cyan]: user canceled.')
+    logging.error('[cyan]fcp[/cyan]: user canceled.')
     progress.stop()
     sys.exit(1)
 
@@ -323,7 +330,7 @@ def main():
                         help='The config file for SSH (default: ~/.ssh/config)')
 
     parser.add_argument('-n', dest='num', type=int, default=8,
-                        help='Max number of connections (default: %(default)s)')
+                        help='Max number of SSH tunnels (default: %(default)s)')
 
     parser.add_argument('-v', dest='verbose', action='count', default=0,
                         help='Verbose mode (default: disable)')

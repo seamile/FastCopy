@@ -10,11 +10,12 @@ from math import ceil
 from paramiko import Channel
 from pathlib import Path
 from queue import Queue, Empty
+from selectors import SelectSelector, EVENT_WRITE
 from socket import socket, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
-from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple, Set,
-                    Tuple, Union)
+from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
+                    Set, Tuple, Union)
 
 from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
                            TransferSpeedColumn)
@@ -22,9 +23,9 @@ from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
 
 SERVER_ADDR = ('127.0.0.1', 7523)
 CHUNK_SIZE = 1024 * 16  # 默认数据块大小 (单位: 字节)
+SSH_MUX = 4
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
-MAX_SEQ = 0xffffffff
 
 Connection = Union[socket, Channel]
 
@@ -220,9 +221,10 @@ class ConnectionPool(Thread):
     def __init__(self, size=16):
         super().__init__(daemon=True)
         self.size = min(size, self._max_size)
-        self.send_q = Queue(self.size * 16)
-        self.recv_q = Queue(self.size * 16)
+        self.send_q = Queue(self.size)
+        self.recv_q = Queue()
         self.done = Event()
+        self.sender = SelectSelector()
         self.connections: Set[Connection] = set()
 
     def send(self, packet: Packet):
@@ -231,16 +233,16 @@ class ConnectionPool(Thread):
     def recv(self, timeout=TIMEOUT) -> Packet:
         return self.recv_q.get(timeout)
 
-    def _send(self, conn: Connection):
-        conn_name = f'{id(conn):x}'
+    def listen_for_send(self):
         while not self.done.is_set():
-            packet: Packet = self.send_q.get()
-            try:
-                send_pkt(conn, packet)
-            except SocketError as e:
-                conn.close()
-                logging.error(f'[Send] conn-{conn_name}: {e}, conn exit.')
-                return
+            for key, _ in self.sender.select(timeout=0.5):
+                packet: Packet = self.send_q.get()
+                conn: Connection = key.fileobj
+                try:
+                    send_pkt(conn, packet)
+                except SocketError as e:
+                    self.pop(conn)
+                    logging.error(f'[Send] conn-{id(conn):x}: {e}, conn exit.')
 
     def _recv(self, conn: Connection):
         conn_name = f'{id(conn):x}'
@@ -250,13 +252,13 @@ class ConnectionPool(Thread):
                 self.recv_q.put(packet)
                 logging.debug(f'[Recv] conn-{conn_name}: {packet}')
             except ConnectionResetError:
-                conn.close()
+                self.pop(conn)
                 return
             except SocketError as e:
-                conn.close()
+                self.pop(conn)
                 logging.error(f'[Recv] conn-{conn_name}: {e}, conn exit.')
             except PacketError:
-                conn.close()
+                self.pop(conn)
                 logging.error(f'conn-{conn_name} received an error packet.')
                 return
 
@@ -269,8 +271,8 @@ class ConnectionPool(Thread):
         if conn in self.connections:
             return True
 
-        t_send = Thread(target=self._send, args=(conn,), daemon=True)
-        t_send.start()
+        self.connections.add(conn)
+        self.sender.register(conn, EVENT_WRITE)
 
         t_recv = Thread(target=self._recv, args=(conn,), daemon=True)
         t_recv.start()
@@ -278,21 +280,21 @@ class ConnectionPool(Thread):
 
     def pop(self, conn: Connection):
         try:
+            self.sender.unregister(conn)
+        except (KeyError, ValueError):
+            pass
+
+        try:
             self.connections.remove(conn)
         except KeyError:
             pass
         finally:
             conn.close()
 
-    def all_closed(self):
-        for conn in self.connections:
-            if not conn.closed:
-                return False
-        return True
-
     def stop(self):
         self.done.set()
-        for conn in self.connections:
+        self.sender.close()
+        for conn in self.connections.copy():
             conn.close()
 
     def run(self):
@@ -300,11 +302,7 @@ class ConnectionPool(Thread):
             raise ValueError('No connection')
 
         self.done.clear()
-        while True:
-            if not self.connections:
-                break
-            if self.done.wait(1):
-                break
+        self.listen_for_send()
         self.stop()
 
 
