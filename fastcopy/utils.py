@@ -23,7 +23,7 @@ from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
 
 SERVER_ADDR = ('127.0.0.1', 7523)
 CHUNK_SIZE = 1024 * 16  # 默认数据块大小 (单位: 字节)
-SSH_MUX = 4
+SSH_MUX = 3
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
@@ -215,6 +215,14 @@ def recv_pkt(conn: Connection) -> Packet:
         raise PacketError
 
 
+class Counter:
+    def __init__(self):
+        self.n_sent = 0
+
+    def acc(self, length):
+        self.n_sent += length
+
+
 class ConnectionPool(Thread):
     _max_size = 128
 
@@ -233,18 +241,57 @@ class ConnectionPool(Thread):
     def recv(self, timeout=TIMEOUT) -> Packet:
         return self.recv_q.get(timeout)
 
-    def listen_for_send(self):
-        while not self.done.is_set():
-            for key, _ in self.sender.select(timeout=0.5):
-                packet: Packet = self.send_q.get()
-                conn: Connection = key.fileobj
-                try:
-                    send_pkt(conn, packet)
-                except SocketError as e:
-                    self.pop(conn)
-                    logging.error(f'[Send] conn-{id(conn):x}: {e}, conn exit.')
+    def add(self, conn: Connection):
+        '''添加一个连接'''
+        # 检查数量是否达到上限
+        if len(self.connections) >= self._max_size:
+            return False
+        # 检查是否已添加过
+        if conn in self.connections:
+            return True
 
-    def _recv(self, conn: Connection):
+        self.connections.add(conn)
+        self.sender.register(conn, EVENT_WRITE, data=Counter())
+
+        t_recv = Thread(target=self.listen_to_recv, args=(conn,), daemon=True)
+        t_recv.start()
+        return True
+
+    def pop(self, conn: Connection):
+        try:
+            self.sender.unregister(conn)
+        except (KeyError, ValueError):
+            pass
+
+        try:
+            self.connections.remove(conn)
+        except KeyError:
+            pass
+        finally:
+            conn.close()
+
+    def listen_to_send(self):
+        while not self.done.is_set():
+            # find the conn that sent the least data
+            keys = [key for key, _ in self.sender.select(timeout=1)]
+            if not keys:
+                continue
+            else:
+                key = min(keys, key=lambda k: k.data.n_sent)
+
+            # get data
+            packet: Packet = self.send_q.get()
+            conn: Connection = key.fileobj
+
+            # send
+            try:
+                send_pkt(conn, packet)
+                key.data.acc(packet.length)
+            except SocketError as e:
+                self.pop(conn)
+                logging.error(f'[Send] conn-{id(conn):x}: {e}, conn exit.')
+
+    def listen_to_recv(self, conn: Connection):
         conn_name = f'{id(conn):x}'
         while not self.done.is_set():
             try:
@@ -262,35 +309,6 @@ class ConnectionPool(Thread):
                 logging.error(f'conn-{conn_name} received an error packet.')
                 return
 
-    def add(self, conn: Connection):
-        '''添加一个连接'''
-        # 检查数量是否达到上限
-        if len(self.connections) >= self._max_size:
-            return False
-        # 检查是否已添加过
-        if conn in self.connections:
-            return True
-
-        self.connections.add(conn)
-        self.sender.register(conn, EVENT_WRITE)
-
-        t_recv = Thread(target=self._recv, args=(conn,), daemon=True)
-        t_recv.start()
-        return True
-
-    def pop(self, conn: Connection):
-        try:
-            self.sender.unregister(conn)
-        except (KeyError, ValueError):
-            pass
-
-        try:
-            self.connections.remove(conn)
-        except KeyError:
-            pass
-        finally:
-            conn.close()
-
     def stop(self):
         self.done.set()
         self.sender.close()
@@ -302,7 +320,7 @@ class ConnectionPool(Thread):
             raise ValueError('No connection')
 
         self.done.clear()
-        self.listen_for_send()
+        self.listen_to_send()
         self.stop()
 
 

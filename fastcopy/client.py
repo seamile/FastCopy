@@ -5,14 +5,15 @@ import sys
 import logging
 import signal
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from functools import partial
 from getpass import getpass, getuser
 from json import dumps
 from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
 from threading import Thread
+from time import sleep
 from typing import Any, Dict, List, Tuple
-from functools import partial
 
 from paramiko import Channel, Transport, SSHConfig
 from paramiko import RSAKey, DSSKey, ECDSAKey, Ed25519Key
@@ -169,26 +170,34 @@ class Client:
 
         return pkey_paths
 
-    @staticmethod
-    def create_transport(sock, user, pkey, password):
+    def create_transport(self, sock, user, pkey, password):
+        if isinstance(sock, tuple):
+            sock = create_connection(sock)
         tp = Transport(sock)
         tp.use_compression(True)
         tp.set_keepalive(60)
         try:
             tp.connect(username=user, pkey=pkey, password=password)
             if tp.is_authenticated():
+                self.tunnels[tp] = []
                 return tp
         except SSHException as e:
             tp.stop_thread()
             logging.error(e)
 
-    @staticmethod
-    def create_channel(transport: Transport) -> Channel:
+    def create_channel(self, transport: Transport) -> Channel:
+        '''create a new channel by transport'''
         try:
+            # create channel
             channel = transport.open_channel(kind='direct-tcpip',
                                              dest_addr=SERVER_ADDR,
                                              src_addr=('localhost', 0))
             channel.settimeout(TIMEOUT)
+
+            # add to self.tunnels
+            channels = self.tunnels.setdefault(transport, [])
+            channels.append(channel)
+
             return channel
         except ChannelException:
             sys.exit(1)
@@ -235,30 +244,42 @@ class Client:
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'[cyan]fcp[/cyan]: '
-                     f'Channel {channel.get_name()} connected')
+        logging.info(f'[cyan]fcp[/cyan]: Channel-{id(channel):x} connected')
 
         return session_id
+
+    def create_attached_channels(self, tp, conn_pool, session_id):
+        channels = self.tunnels[tp]
+        attach_pkt = Packet.load(Flag.ATTACH, session_id)
+
+        def _attache_channel():
+            channel = self.create_channel(tp)
+            send_pkt(channel, attach_pkt)
+            conn_pool.add(channel)
+            logging.info(f'[cyan]fcp[/cyan]: Channel-{id(channel):x} connected')
+
+        for _ in range(SSH_MUX - len(channels)):
+            thr = Thread(target=_attache_channel, daemon=True)
+            thr.start()
 
     def attached_connect(self, conn_pool, session_id, pkey, password):
         '''后续连接'''
         addr = (self.host, self.port)
-        attach_pkt = Packet.load(Flag.ATTACH, session_id)
 
-        # create transports
-        for _ in range(self.n_tunnel - len(self.tunnels)):
+        def _attache():
             tp = self.create_transport(addr, self.username, pkey, password)
-            self.tunnels[tp] = []
+            self.create_attached_channels(tp, conn_pool, session_id)
 
-        # create channels
-        for tp, channels in self.tunnels.items():
-            for _ in range(SSH_MUX - len(channels)):
-                channel = self.create_channel(tp)
-                send_pkt(channel, attach_pkt)
-                channels.append(channel)
-                conn_pool.add(channel)
-                logging.info(f'[cyan]fcp[/cyan]: '
-                             f'Channel {channel.get_name()} connected')
+        # create channels from exists transports
+        for tp in self.tunnels:
+            self.create_attached_channels(tp, conn_pool, session_id)
+
+        # create new transports
+        for _ in range(self.n_tunnel - len(self.tunnels)):
+            thr = Thread(target=_attache,
+                         daemon=True)
+            thr.start()
+            sleep(0.1)  # 并发连接同一SSH服务器可能会报错，所以加一点延迟
 
     def start(self):
         try:
