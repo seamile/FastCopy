@@ -31,7 +31,15 @@ class Client:
 
     def __init__(self, cli_parser: ArgumentParser):
         args = cli_parser.parse_args()
-        self.set_log(args.verbose)
+
+        # init logger
+        self.log_level = {
+            0: logging.ERROR,
+            1: logging.WARNING,
+            2: logging.INFO,
+            3: logging.DEBUG
+        }.get(args.verbose, logging.ERROR)
+        self.set_log()
 
         try:
             # init instance attributes from CLI args:
@@ -42,7 +50,8 @@ class Client:
             #   - self.dst:      dest dir or file
             self.parse_cli_args(args)
         except Exception as e:
-            logging.error(e)
+            logging.error(f'fcp: {e}')
+            print('--------------------------------')
             cli_parser.print_help()
             sys.exit(1)
 
@@ -89,27 +98,20 @@ class Client:
             self.action = Flag.PUSH
             self.srcs = [abspath(path) for path in args.srcs]
         else:
-            raise ValueError('Server address not specified.')
+            raise ValueError('The server address is not specified.')
 
-    def set_log(self, verbose_mode):
+    def set_log(self):
         '''处理日志'''
         global print
         print = partial(progress.print, style='blue')
 
-        log_level = {
-            0: logging.ERROR,
-            1: logging.WARNING,
-            2: logging.INFO,
-            3: logging.DEBUG
-        }.get(verbose_mode, logging.ERROR)
-
-        if log_level <= logging.ERROR:
+        if self.log_level <= logging.ERROR:
             logging.error = partial(progress.print, style='red')
-        if log_level <= logging.WARNING:
+        if self.log_level <= logging.WARNING:
             logging.warning = partial(progress.print, style='yellow')
-        if log_level <= logging.INFO:
+        if self.log_level <= logging.INFO:
             logging.info = partial(progress.print, style='blue')
-        if log_level <= logging.DEBUG:
+        if self.log_level <= logging.DEBUG:
             logging.debug = partial(progress.print, style='white')
 
         print = partial(progress.print, style='blue')
@@ -183,7 +185,7 @@ class Client:
                 return tp
         except SSHException as e:
             tp.stop_thread()
-            logging.error(e)
+            logging.error(f'fcp: {e}')
 
     def create_channel(self, transport: Transport) -> Channel:
         '''create a new channel by transport'''
@@ -199,7 +201,8 @@ class Client:
             channels.append(channel)
 
             return channel
-        except ChannelException:
+        except (SSHException, ChannelException) as e:
+            logging.error(f'fcp: {e}')
             sys.exit(1)
 
     def ssh_connect(self) -> Tuple[Transport, Any, Any]:  # type: ignore
@@ -235,7 +238,7 @@ class Client:
                 self.tunnels[tp] = []
                 return tp, None, password
 
-        logging.error('Failed to create SSH tunnel')
+        logging.error('fcp: failed to create SSH tunnel')
         sys.exit(1)
 
     def handshake(self, channel, remote_path: str):
@@ -314,8 +317,9 @@ class Client:
             porter.join()
             print('[cyan]fcp[/cyan]: [bold green]finished![/bold green]')
         except Exception as e:
-            logging.error(f'[cyan]fcp[/cyan]: {e}, exit.')
-            progress.console.print_exception()
+            logging.error(f'fcp: {e}')
+            if self.log_level == logging.DEBUG:
+                progress.console.print_exception()
             sys.exit(1)
         finally:
             progress.stop()
@@ -323,7 +327,7 @@ class Client:
 
 def handle_sigint(signum, frame):
     '''键盘中断事件的处理'''
-    logging.error('[cyan]fcp[/cyan]: user canceled.')
+    logging.error('fcp: user canceled.')
     progress.stop()
     sys.exit(1)
 

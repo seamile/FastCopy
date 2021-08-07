@@ -50,7 +50,7 @@ class Flag(IntEnum):
     FILE_READY = 9   # 文件就绪
     FILE_CHUNK = 10  # 数据传输
     DONE = 11        # 完成
-    EXCEPTION = 13   # 异常退出
+    EXCEPTION = 12   # 异常退出
 
     @classmethod
     def contains(cls, member: object) -> bool:
@@ -104,7 +104,7 @@ class Packet(NamedTuple):
         elif flag == Flag.EXCEPTION:
             body = str(args[0]).encode('utf8')
         else:
-            raise ValueError('Invalid flag')
+            raise ValueError(f'{flag} is not a valid Flag')
         return Packet(flag, body)
 
     def pack(self) -> bytes:
@@ -163,7 +163,7 @@ class Packet(NamedTuple):
             return (self.body.decode('utf-8'),)
 
         else:
-            raise TypeError
+            raise ValueError(f'{self.flag} is not a valid Flag')
 
     def is_valid(self, chksum: int):
         '''是否是有效的包体'''
@@ -547,10 +547,10 @@ class Sender(Thread):
                     if not cls.need_exclude(relpath, exclude):
                         yield sub_path, relpath
             else:
-                logging.error(f'[Sender] The {fullpath} is not '
-                              f'a regular file or dir.')
+                logging.warning(f'[Sender] The {fullpath} is not '
+                                f'a regular file or dir.')
         else:
-            logging.error(f'[Sender] No such file or directory: {fullpath}.')
+            logging.warning(f'[Sender] No such file or directory: {fullpath}.')
 
     @classmethod
     def search_files_and_dirs(cls, path: str, include: str, exclude: list) \
@@ -593,8 +593,11 @@ class Sender(Thread):
                     logging.debug(f'[Sender] Name conflict: '
                                   f'{relpath.as_posix()}, ignore.')
 
-        count_pkt = Packet.load(Flag.FILE_COUNT, _id)
-        self.conn_pool.send(count_pkt)
+        if _id == 0:
+            packet = Packet.load(Flag.EXCEPTION, 'No such file or directory')
+        else:
+            packet = Packet.load(Flag.FILE_COUNT, _id)
+        self.conn_pool.send(packet)
         logging.info(f'[Sender] Num of files and dirs: {_id}')
 
     def run(self):
@@ -617,6 +620,8 @@ class Sender(Thread):
                 packet = self.conn_pool.recv()
             except Empty:
                 logging.error('[Sender] get input queue timeout, exit.')
+                exit_pkt = Packet.load(Flag.EXCEPTION, 'waitting timeout.')
+                self.conn_pool.send(exit_pkt)
                 break
 
             if packet.flag == Flag.FILE_READY:
@@ -798,6 +803,8 @@ class Receiver(Thread):
         else:
             logging.error(f'[Receiver] The first packet must be `MONOFILE` '
                           f'but receive `{packet.flag.name}`')
+            exit_pkt = Packet.load(Flag.EXCEPTION, 'packet type error.')
+            self.conn_pool.send(exit_pkt)
             return
 
         # 等待接收文件信息和数据
@@ -817,7 +824,7 @@ class Receiver(Thread):
 
             elif packet.flag == Flag.EXCEPTION:
                 msg, = packet.unpack_body()
-                logging.error(f'[Receiver] Peer quitted: {msg}')
+                logging.error(f'fcp: the sender exit due to `{msg}`')
                 break
 
             else:
