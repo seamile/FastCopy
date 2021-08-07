@@ -50,7 +50,6 @@ class Flag(IntEnum):
     FILE_READY = 9   # 文件就绪
     FILE_CHUNK = 10  # 数据传输
     DONE = 11        # 完成
-    RESEND = 12      # 错误回传
     EXCEPTION = 13   # 异常退出
 
     @classmethod
@@ -102,8 +101,6 @@ class Packet(NamedTuple):
             body = pack(f'>2I{length}s', *args)
         elif flag == Flag.DONE:
             body = pack('>?', True)
-        elif flag == Flag.RESEND:
-            body = pack('>I', *args)
         elif flag == Flag.EXCEPTION:
             body = str(args[0]).encode('utf8')
         else:
@@ -161,9 +158,6 @@ class Packet(NamedTuple):
 
         elif self.flag == Flag.DONE:
             return unpack('>?', self.body)
-
-        elif self.flag == Flag.RESEND:
-            return unpack('>I', self.body)
 
         elif self.flag == Flag.EXCEPTION:
             return (self.body.decode('utf-8'),)
