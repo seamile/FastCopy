@@ -4,6 +4,7 @@ import logging
 from binascii import crc32
 from collections import deque
 from enum import IntEnum
+from functools import wraps
 from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
@@ -14,11 +15,12 @@ from selectors import SelectSelector, EVENT_WRITE
 from socket import socket, error as SocketError
 from struct import pack, unpack
 from threading import Event, Semaphore, Thread
+from time import sleep
 from typing import (Any, Deque, Dict, Generator, Iterable, List, NamedTuple,
                     Set, Tuple, Union)
 
-from rich.progress import (BarColumn, Progress, TaskID, TextColumn,
-                           TransferSpeedColumn)
+from rich.progress import (BarColumn, Progress, TaskID, SpinnerColumn,
+                           TextColumn, TransferSpeedColumn)
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
@@ -29,13 +31,30 @@ LEN_HEAD = 7
 
 Connection = Union[socket, Channel]
 
-progress = Progress(
+trans_progress = Progress(
     TextColumn("[bold blue]{task.fields[filename]}"),
+    SpinnerColumn(finished_text='✓'),
     BarColumn(bar_width=60),
     TransferSpeedColumn(),
     "•",
     "[progress.percentage]{task.percentage:>3.1f}%"
 )
+
+
+def retry(num, *, wait, exceptions=(Exception,)):
+    def deco(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for i in range(num):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as err:
+                    if i + 1 == num:
+                        raise RuntimeError from err
+                    sleep(wait)
+                    continue
+        return wrapper
+    return deco
 
 
 class Flag(IntEnum):
@@ -283,7 +302,7 @@ class ConnectionPool(Thread):
                 key.data.acc(packet.length)
             except SocketError as e:
                 self.pop(conn)
-                logging.error(f'[Send] conn-{id(conn):x}: {e}, conn exit.')
+                logging.warning(f'[Send] Conn-{id(conn):x}: {e}.')
 
     def listen_to_recv(self, conn: Connection):
         conn_name = f'{id(conn):x}'
@@ -297,7 +316,7 @@ class ConnectionPool(Thread):
                 return
             except SocketError as e:
                 self.pop(conn)
-                logging.error(f'[Recv] conn-{conn_name}: {e}, conn exit.')
+                logging.warning(f'[Recv] Conn-{conn_name}: {e}.')
             except PacketError:
                 self.pop(conn)
                 logging.error(f'conn-{conn_name} received an error packet.')
@@ -533,8 +552,11 @@ class Sender(Thread):
         return False
 
     @classmethod
-    def checkout_paths(cls, fullpath: Path, include: str, exclude: Iterable[str]) \
-            -> Generator[Tuple[Path, Path], None, None]:
+    def checkout_paths(cls,
+                       fullpath: Path,
+                       include: str,
+                       exclude: Iterable[str]
+                       ) -> Generator[Tuple[Path, Path], None, None]:
         '''检出路径'''
         if fullpath.exists():
             if fullpath.is_file():
@@ -571,7 +593,9 @@ class Sender(Thread):
         _id = 0
         relpaths = set()
         for src_path in self.srcs:
-            items = self.search_files_and_dirs(src_path, self.include, self.exclude)
+            items = self.search_files_and_dirs(src_path,
+                                               self.include,
+                                               self.exclude)
             for fullpath, relpath in items:
                 if relpath not in relpaths:
                     # 整理目录树
@@ -629,7 +653,7 @@ class Sender(Thread):
                 f_info = self.tree[f_id]
 
                 # 添加进度条任务
-                task_id = progress.add_task(
+                task_id = trans_progress.add_task(
                     f'upload-{f_info.name}',
                     filename=f_info.name,
                     total=f_info.size,
@@ -639,7 +663,7 @@ class Sender(Thread):
                 # 发送文件数据块
                 for chunk_packet in f_info.iread():
                     self.conn_pool.send(chunk_packet)
-                    progress.update(task_id, advance=chunk_packet.length)
+                    trans_progress.update(task_id, advance=chunk_packet.length)
 
             elif packet.flag == Flag.DONE:
                 logging.info('[Sender] All files are processed, exit.')
@@ -670,7 +694,7 @@ class Receiver(Thread):
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
         self.ready_files: Deque[int] = deque()
-        self.progress_tasks: Dict[int, TaskID] = {}
+        self.trans_progress_tasks: Dict[int, TaskID] = {}
 
     def check_dst_path(self):
         '''检查目标路径'''
@@ -716,13 +740,13 @@ class Receiver(Thread):
                 self.ready_files.popleft()
 
                 # 添加进度条任务
-                task_id = progress.add_task(
+                task_id = trans_progress.add_task(
                     f'download-{f_info.name}',
                     filename=f_info.name,
                     total=f_info.size,
                     start=True
                 )
-                self.progress_tasks[f_id] = task_id
+                self.trans_progress_tasks[f_id] = task_id
             else:
                 break
 
@@ -768,7 +792,8 @@ class Receiver(Thread):
             logging.debug(f'[Receiver] Write chunk({seq}) '
                           f'into {self.files[f_id].s_relpath}')
             iwriter = self.get_iwriter(f_id)
-            progress.update(self.progress_tasks[f_id], advance=len(chunk))
+            trans_progress.update(self.trans_progress_tasks[f_id],
+                                  advance=len(chunk))
             iwriter.send((seq, chunk))
         except StopIteration:
             # 释放并发计数器
@@ -834,7 +859,8 @@ class Receiver(Thread):
         logging.info('[Receiver] All files finished.')
 
         self.conn_pool.stop()
-        logging.debug(f'Receiver-{self.sid.hex()[:8]} exit')
+        self.conn_pool.join()
+        logging.info(f'Receiver-{self.sid.hex()[:8]} exit')
 
 
 Porter = Union[Sender, Receiver]
