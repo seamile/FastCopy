@@ -12,6 +12,7 @@ from os.path import abspath
 from socket import create_connection
 from textwrap import dedent
 from threading import Thread
+from time import sleep
 from typing import Any, Dict, List, Tuple
 
 from paramiko import Channel, Transport, SSHConfig
@@ -63,7 +64,7 @@ class Client:
             #   - self.dst:      dest dir or file
             self.parse_cli_args(args)
         except Exception as e:
-            logging.error(f'[b]fcp[/b]: {e}')
+            logging.fatal(f'[b]fcp[/b]: {e}')
             print('--------------------------------')
             cli_parser.print_help()
             sys.exit(1)
@@ -119,6 +120,7 @@ class Client:
         '''处理日志'''
         logging.root.setLevel(self.log_level)
         if self.log_level <= logging.ERROR:
+            logging.fatal = partial(conn_progress.print, style='magenta')
             logging.error = partial(conn_progress.print, style='red')
         if self.log_level <= logging.WARNING:
             logging.warning = partial(conn_progress.print, style='yellow')
@@ -127,7 +129,7 @@ class Client:
         if self.log_level <= logging.DEBUG:
             logging.debug = partial(conn_progress.print, style='white')
 
-        logging.getLogger("paramiko").setLevel(logging.ERROR)
+        logging.getLogger("paramiko").setLevel(logging.FATAL)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
@@ -183,6 +185,7 @@ class Client:
 
         return pkey_paths
 
+    @retry(3, wait=0.3, exceptions=ConnectionResetError)
     def create_transport(self, sock, user, pkey, password):
         if isinstance(sock, tuple):
             sock = create_connection(sock)
@@ -196,7 +199,10 @@ class Client:
                 return tp
         except SSHException as e:
             tp.stop_thread()
-            logging.error(f'[b]fcp[/b]: {e}')
+            if 'Connection reset by peer' in str(e):
+                raise ConnectionResetError from e
+            else:
+                logging.error(f'[b]fcp[/b]: create transport failed due to {e}')
 
     def create_channel(self, transport: Transport) -> Channel:  # type: ignore
         '''create a new channel by transport'''
@@ -214,7 +220,7 @@ class Client:
             conn_progress.update(self.conn_tid, advance=1)
             return channel
         except (SSHException, ChannelException) as e:
-            logging.error(f'[b]fcp[/b]: {e}')
+            logging.error(f'[b]fcp[/b]: create channel failed due to {e}')
             sys.exit(1)
 
     def ssh_connect(self) -> Tuple[Transport, Any, Any]:  # type: ignore
@@ -281,7 +287,7 @@ class Client:
         '''后续连接'''
         addr = (self.host, self.port)
 
-        @retry(3, wait=0.2)
+        @retry(3, wait=0.3)
         def _attache():
             tp = self.create_transport(addr, self.username, pkey, password)
             self.create_attached_channels(tp, conn_pool, session_id)
@@ -292,9 +298,9 @@ class Client:
 
         # create new transports
         for _ in range(self.n_tunnel - len(self.tunnels)):
-            thr = Thread(target=_attache,
-                         daemon=True)
+            thr = Thread(target=_attache, daemon=True)
             thr.start()
+            sleep(0.3)
 
     def start(self):
         with Live(progress_table, refresh_per_second=10):
@@ -325,7 +331,7 @@ class Client:
 
                 porter.join()
             except Exception as e:
-                logging.error(f'[b]fcp[/b]: {e}')
+                logging.fatal(f'[b]fcp[/b]: {e}')
                 if self.log_level == logging.DEBUG:
                     trans_progress.console.print_exception()
                 sys.exit(1)

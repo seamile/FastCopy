@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import daemon
 
-from .utils import Flag, SERVER_ADDR
+from .utils import Flag, SERVER_ADDR, TIMEOUT
 from .utils import Packet, send_pkt, recv_pkt
 from .utils import Sender, Receiver, Porter
 
@@ -31,7 +31,7 @@ class WatchDog(Thread):
                           % self.sock.getpeername())
             self.sock.settimeout(60)
             packet = recv_pkt(self.sock)
-            self.sock.settimeout(None)
+            self.sock.settimeout(TIMEOUT)
         except ConnectionResetError:
             logging.error('[WatchDog] connection reset by peer.')
             return

@@ -24,8 +24,8 @@ from rich.progress import (BarColumn, Progress, TaskID, SpinnerColumn,
 
 
 SERVER_ADDR = ('127.0.0.1', 7523)
-CHUNK_SIZE = 1024 * 16  # 默认数据块大小 (单位: 字节)
-SSH_MUX = 3
+CHUNK_SIZE = 1024  # 默认数据块大小 (单位: 字节)
+SSH_MUX = 2
 TIMEOUT = 60 * 5  # 全局超时时间
 LEN_HEAD = 7
 
@@ -807,7 +807,6 @@ class Receiver(Thread):
                 logging.info(f'[Receiver] File finished: '
                              f'{self.files[f_id].s_relpath}')
             else:
-                # TODO: 错误重传
                 logging.error(f'[Receiver] Bad file hash: '
                               f'{self.files[f_id].s_relpath}')
 
