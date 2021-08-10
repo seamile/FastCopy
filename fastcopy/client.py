@@ -27,8 +27,8 @@ from .utils import Sender, Receiver, trans_progress
 
 
 conn_progress = Progress(
-    TextColumn("[bold blue]Tunnels:"),
-    TextColumn("[progress.percentage]{task.completed}"),
+    TextColumn("[bold blue]Connecting "),
+    TextColumn("[progress.percentage]{task.completed}/{task.total} "),
     SpinnerColumn(finished_text='✓')
 )
 
@@ -63,7 +63,7 @@ class Client:
             #   - self.dst:      dest dir or file
             self.parse_cli_args(args)
         except Exception as e:
-            logging.error(f'fcp: {e}')
+            logging.error(f'[b]fcp[/b]: {e}')
             print('--------------------------------')
             cli_parser.print_help()
             sys.exit(1)
@@ -117,21 +117,17 @@ class Client:
 
     def set_log(self):
         '''处理日志'''
-        global print
-        print = partial(trans_progress.print, style='blue')
-
         logging.root.setLevel(self.log_level)
         if self.log_level <= logging.ERROR:
-            logging.error = partial(trans_progress.print, style='red')
+            logging.error = partial(conn_progress.print, style='red')
         if self.log_level <= logging.WARNING:
-            logging.warning = partial(trans_progress.print, style='yellow')
+            logging.warning = partial(conn_progress.print, style='yellow')
         if self.log_level <= logging.INFO:
-            logging.info = partial(trans_progress.print, style='blue')
+            logging.info = partial(conn_progress.print, style='blue')
         if self.log_level <= logging.DEBUG:
-            logging.debug = partial(trans_progress.print, style='white')
+            logging.debug = partial(conn_progress.print, style='white')
 
-        paramiko_logger = logging.getLogger("paramiko")
-        paramiko_logger.setLevel(logging.ERROR)
+        logging.getLogger("paramiko").setLevel(logging.ERROR)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
@@ -200,7 +196,7 @@ class Client:
                 return tp
         except SSHException as e:
             tp.stop_thread()
-            logging.error(f'fcp: {e}')
+            logging.error(f'[b]fcp[/b]: {e}')
 
     def create_channel(self, transport: Transport) -> Channel:  # type: ignore
         '''create a new channel by transport'''
@@ -218,7 +214,7 @@ class Client:
             conn_progress.update(self.conn_tid, advance=1)
             return channel
         except (SSHException, ChannelException) as e:
-            logging.error(f'fcp: {e}')
+            logging.error(f'[b]fcp[/b]: {e}')
             sys.exit(1)
 
     def ssh_connect(self) -> Tuple[Transport, Any, Any]:  # type: ignore
@@ -254,7 +250,7 @@ class Client:
                 self.tunnels[tp] = []
                 return tp, None, password
 
-        logging.error('fcp: failed to create SSH tunnel')
+        logging.error('[b]fcp[/b]: failed to create SSH tunnel')
         sys.exit(1)
 
     def handshake(self, channel, remote_path: str):
@@ -263,7 +259,7 @@ class Client:
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
-        logging.info(f'[cyan]fcp[/cyan]: Channel-{id(channel):x} connected')
+        logging.info(f'[b]fcp[/b]: Channel-{id(channel):x} connected')
 
         return session_id
 
@@ -275,7 +271,7 @@ class Client:
             channel = self.create_channel(tp)
             send_pkt(channel, attach_pkt)
             conn_pool.add(channel)
-            logging.info(f'[cyan]fcp[/cyan]: Channel-{id(channel):x} connected')
+            logging.info(f'[b]fcp[/b]: Channel-{id(channel):x} connected')
 
         for _ in range(SSH_MUX - len(channels)):
             thr = Thread(target=_attache_channel, daemon=True)
@@ -314,12 +310,10 @@ class Client:
                     }, ensure_ascii=False, separators=(',', ':'))
                     session_id = self.handshake(first_channel, remote_path)
                     porter = Receiver(session_id, self.dst, self.n_channel)
-                    print('[bold blue]Receiving files')
                 else:
                     session_id = self.handshake(first_channel, self.dst)
                     porter = Sender(session_id, self.srcs, self.n_channel,
                                     self.include, self.exclude)
-                    print('[bold blue]Sending files')
 
                 porter.conn_pool.add(first_channel)
                 porter.start()
@@ -330,9 +324,8 @@ class Client:
                 t.start()
 
                 porter.join()
-                print('[bold green]All tasks completed!\n')
             except Exception as e:
-                logging.error(f'fcp: {e}')
+                logging.error(f'[b]fcp[/b]: {e}')
                 if self.log_level == logging.DEBUG:
                     trans_progress.console.print_exception()
                 sys.exit(1)
@@ -340,7 +333,8 @@ class Client:
 
 def handle_sigint(signum, frame):
     '''键盘中断事件的处理'''
-    logging.error('fcp: user canceled.')
+    logging.error('[b]fcp[/b]: user canceled.')
+    conn_progress.stop()
     trans_progress.stop()
     sys.exit(1)
 
