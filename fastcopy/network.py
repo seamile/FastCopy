@@ -1,8 +1,8 @@
 import logging
 from binascii import crc32
 from enum import IntEnum
-from queue import Queue
 from paramiko import Channel
+from queue import Queue
 from selectors import SelectSelector, EVENT_WRITE
 from socket import socket, error as SocketError
 from struct import pack, unpack

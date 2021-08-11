@@ -4,9 +4,9 @@ import _socket
 import logging
 from argparse import ArgumentParser
 from json import loads
-from socket import socket
-from socket import error as SocketError, timeout as TimeoutError
 from socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, SO_REUSEPORT
+from socket import error as SocketError, timeout as TimeoutError
+from socket import socket
 from threading import Lock, Thread
 from typing import Dict
 from uuid import uuid4

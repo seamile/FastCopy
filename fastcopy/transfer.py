@@ -13,8 +13,8 @@ from typing import Deque, Dict, Generator, Iterable, List, Tuple, Union
 from rich.progress import (BarColumn, Progress, TaskID, SpinnerColumn,
                            TextColumn, TransferSpeedColumn)
 
-from .network import Flag, ConnectionPool, Packet
 from .config import CHUNK_SIZE
+from .network import Flag, ConnectionPool, Packet
 
 
 trans_progress = Progress(
