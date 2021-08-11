@@ -13,9 +13,9 @@ from uuid import uuid4
 
 import daemon
 
-from .utils import Flag, SERVER_ADDR, TIMEOUT
-from .utils import Packet, send_pkt, recv_pkt
-from .utils import Sender, Receiver, Porter
+from .config import SERVER_ADDR, TIMEOUT
+from .network import Flag, Packet, send_pkt, recv_pkt
+from .transfer import Sender, Receiver, Porter
 
 
 class WatchDog(Thread):

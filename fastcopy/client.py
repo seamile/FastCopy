@@ -5,7 +5,7 @@ import sys
 import logging
 import signal
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from functools import partial
+from functools import partial, wraps
 from getpass import getpass, getuser
 from json import dumps
 from os.path import abspath
@@ -22,9 +22,9 @@ from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from .utils import SERVER_ADDR, SSH_MUX, TIMEOUT
-from .utils import Flag, Packet, send_pkt, recv_pkt, retry
-from .utils import Sender, Receiver, trans_progress
+from .config import SERVER_ADDR, SSH_MUX, TIMEOUT
+from .network import Flag, Packet, send_pkt, recv_pkt
+from .transfer import Sender, Receiver, trans_progress
 
 
 conn_progress = Progress(
@@ -36,6 +36,22 @@ conn_progress = Progress(
 progress_table = Table.grid()
 progress_table.add_row(conn_progress)  # type: ignore
 progress_table.add_row(trans_progress)  # type: ignore
+
+
+def retry(num, *, wait, exceptions=(Exception,)):
+    def deco(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for i in range(num):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as err:
+                    if i + 1 == num:
+                        raise RuntimeError from err
+                    sleep(wait)
+                    continue
+        return wrapper
+    return deco
 
 
 class Client:
