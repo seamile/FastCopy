@@ -2,11 +2,12 @@ import logging
 from binascii import crc32
 from enum import IntEnum
 from paramiko import Channel
-from queue import Queue
+from queue import Empty, Queue
 from selectors import SelectSelector, EVENT_WRITE
 from socket import socket, error as SocketError
 from struct import pack, unpack
 from threading import Event, Thread
+from time import sleep
 from typing import Any, NamedTuple, Set, Tuple, Union
 
 from .config import TIMEOUT, LEN_HEAD
@@ -250,8 +251,11 @@ class ConnectionPool(Thread):
                 key = min(keys, key=lambda k: k.data.n_sent)
 
             # get data
-            packet: Packet = self.send_q.get()
-            conn: Connection = key.fileobj
+            try:
+                packet: Packet = self.send_q.get(timeout=TIMEOUT)
+                conn: Connection = key.fileobj
+            except Empty:
+                break
 
             # send
             try:
@@ -280,6 +284,8 @@ class ConnectionPool(Thread):
                 return
 
     def stop(self):
+        while not self.send_q.empty():
+            sleep(0.2)
         self.done.set()
         self.sender.close()
         for conn in self.connections.copy():

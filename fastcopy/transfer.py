@@ -548,7 +548,6 @@ class Receiver(Thread):
         logging.info('[Receiver] All files finished.')
 
         self.conn_pool.stop()
-        self.conn_pool.join()
         logging.info(f'Receiver-{self.sid.hex()[:8]} exit')
 
 
