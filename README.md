@@ -142,7 +142,7 @@ pip install fastcopy
 
 7. 文件数据块传输报文
 
-    Chunk Sequence 占用 4 字节，所以支持的单个文件最大为: 4 GB * ChunkSize
+    Chunk Sequence 占用 4 字节，所以支持的单个文件最大为: ChunkSize * 2 ** 32
 
     - 方向: Sender -> Receiver
     - Payload 格式:
