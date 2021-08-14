@@ -48,9 +48,9 @@ pip install fastcopy
 
 ### 1. 报文统一格式
 
-|  flag   | chksum  | length  | payload |
-| :-----: | :-----: | :-----: | :-----: |
-| 1 Bytes | 4 Bytes | 2 Bytes |   ...   |
+|  flag  | chksum  | length  | payload |
+| :----: | :-----: | :-----: | :-----: |
+| 1 Byte | 4 Bytes | 2 Bytes |   ...   |
 
 ### 2. 报文类型
 
@@ -125,9 +125,9 @@ pip install fastcopy
     - 方向: Sender -> Receiver
     - Payload 格式:
 
-        | file_id |  perm   |  size   |  mtime  |  chksum  | path  |
-        | :-----: | :-----: | :-----: | :-----: | :------: | :---: |
-        | 4 Bytes | 2 Bytes | 8 Bytes | 8 Bytes | 16 Bytes |  ...  |
+        | file_id |  perm   |  size   |  mtime  | n_chksum |       chksum        | path  |
+        | :-----: | :-----: | :-----: | :-----: | :------: | :-----------------: | :---: |
+        | 4 Bytes | 2 Bytes | 8 Bytes | 8 Bytes |  1 Byte  | 16 Bytes * n_chksum |  ...  |
 
 6. 接收端文件准备就绪
 

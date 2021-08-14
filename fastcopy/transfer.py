@@ -47,7 +47,7 @@ class DirInfo:
                 f'path={self.s_relpath})')
 
     @classmethod
-    def load(cls, dir_id: int, fullpath: Path, relpath: Path):
+    def load_from(cls, dir_id: int, fullpath: Path, relpath: Path):
         d_info = cls(dir_id, fullpath.stat().st_mode, bytes(relpath))
         d_info.abspath = fullpath
         return d_info
@@ -104,19 +104,16 @@ class FileInfo:
     def name(self) -> str:
         return self.abspath.name
 
-    @property
-    def n_chunks(self):
-        return ceil(self.size / CHUNK_SIZE)
-
     @classmethod
-    def load(cls, file_id: int, fullpath: Path, relpath: Path):
+    def load_from(cls, file_id: int, fullpath: Path, relpath: Path):
         # 读取文件状态信息
         stat = fullpath.stat()
         f_info = cls(file_id,
                      stat.st_mode,   # 权限, 2 Bytes
                      stat.st_size,   # 大小, 8 Bytes
                      stat.st_mtime,  # 修改时间, 8 Bytes
-                     cls.hash(fullpath),  # 文件 MD5 校验码
+                     # 文件每块 MD5 校验码
+                     cls.hash(fullpath, stat.st_size),
                      bytes(relpath))
         f_info.abspath = fullpath
         return f_info
@@ -146,10 +143,11 @@ class FileInfo:
             open(self.abspath, 'w').close()
             self.set_stat()
 
-    def iread(self) -> Generator[Packet, None, None]:
+    def iread(self, position) -> Generator[Packet, None, None]:
         '''封装文件数据块报文'''
         with open(self.abspath, 'rb') as fp:
             seq = 0
+            fp.seek(position)
             # 读取单位长度的数据，如果为空则跳出循环
             while True:
                 chunk = fp.read(CHUNK_SIZE)
@@ -159,17 +157,19 @@ class FileInfo:
                 else:
                     break
 
-    def iwrite(self) -> Generator[None, Tuple[int, bytes], None]:
+    def iwrite(self, position) -> Generator[None, Tuple[int, bytes], None]:
         '''按数据块迭代写入'''
         # 确保文件的上级目录存在
         self.abspath.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
 
         # 定义文件所有数据块编号集
-        seqs = {i for i in range(self.n_chunks)}
+        n_chunks = ceil((self.size - position) / CHUNK_SIZE)
+        seqs = {i for i in range(n_chunks)}
 
         # 开始迭代写入
         mode = 'rb+' if self.abspath.is_file() else 'wb'
         with open(self.abspath, mode) as fp:
+            fp.seek(position)
             while seqs:
                 seq, chunk = yield
                 if seq in seqs:
@@ -178,21 +178,57 @@ class FileInfo:
                     seqs.remove(seq)
 
     @staticmethod
-    def hash(filepath: Path) -> bytes:
-        hasher = md5()
-        with open(filepath, 'rb') as fp:
-            while True:
-                chunk = fp.read(CHUNK_SIZE)
-                if chunk:
-                    hasher.update(chunk)
-                else:
-                    break
-        return hasher.digest()
+    def block_size(size: int):
+        return ceil(size / 2 ** 20) * CHUNK_SIZE
 
-    def is_vaild(self):
-        '''检查文件校验和'''
-        return (self.abspath.is_file()
-                and self.hash(self.abspath) == self.chksum)
+    @staticmethod
+    def iread_block(file, block_size: int, position: int = None
+                    ) -> Generator[bytes, None, None]:
+        '''以迭代器的方式从文件读取指定大小的数据块'''
+        if position:
+            file.seek(position)
+
+        while block_size > 0:
+            _size = min(CHUNK_SIZE, block_size)
+            data = file.read(_size)
+            if not data:
+                break
+            else:
+                block_size -= len(data)
+                yield data
+
+    @classmethod
+    def ihash(cls, filepath: Path, size: int) -> Generator[bytes, None, None]:
+        hasher = md5()
+        if size <= 0:
+            yield hasher.digest()
+
+        b_size = cls.block_size(size)
+
+        with open(filepath, 'rb') as fp:
+            while size > 0:
+                for data in cls.iread_block(fp, b_size):
+                    hasher.update(data)
+                    size -= len(data)
+                else:
+                    yield hasher.digest()
+
+    @classmethod
+    def hash(cls, filepath: Path, size: int) -> bytes:
+        return b''.join(cls.ihash(filepath, size))
+
+    def diff(self):
+        '''return the different position'''
+        if not self.abspath.is_file():
+            return 0
+
+        b_size = self.block_size(self.size)
+        hasher = self.ihash(self.abspath, self.size)
+        for i, chksum in enumerate(hasher):
+            if chksum != self.chksum[i * 16:(i + 1) * 16]:
+                return i * b_size  # 不一致时，返回当前数据块的起始位置
+        else:
+            return -1  # 完全一致，返回 -1
 
 
 class Sender(Thread):
@@ -294,7 +330,7 @@ class Sender(Thread):
                         inf_cls, flag = FileInfo, Flag.FILE_INFO
                     else:
                         inf_cls, flag = DirInfo, Flag.DIR_INFO
-                    self.tree[_id] = inf_cls.load(_id, fullpath, relpath)
+                    self.tree[_id] = inf_cls.load_from(_id, fullpath, relpath)
 
                     # 将 文件/目录 信息发送给接收端
                     info_pkt = Packet.load(flag, *self.tree[_id])
@@ -339,7 +375,7 @@ class Sender(Thread):
                 break
 
             if packet.flag == Flag.FILE_READY:
-                f_id, = packet.unpack_body()
+                f_id, position = packet.unpack_body()
                 f_info = self.tree[f_id]
 
                 # 添加进度条任务
@@ -347,11 +383,12 @@ class Sender(Thread):
                     f'upload-{f_info.name}',
                     filename=f_info.name,
                     total=f_info.size,
+                    completed=position,
                     start=True
                 )
 
                 # 发送文件数据块
-                for chunk_packet in f_info.iread():
+                for chunk_packet in f_info.iread(position):
                     self.conn_pool.send(chunk_packet)
                     trans_progress.update(task_id, advance=chunk_packet.length)
 
@@ -383,8 +420,8 @@ class Receiver(Thread):
         self.concurrency = Semaphore(8)  # 允许同时写入的文件数
         self.files: Dict[int, FileInfo] = {}
         self.iwriters: Dict[int, Generator] = {}
-        self.ready_files: Deque[int] = deque()
-        self.trans_progress_tasks: Dict[int, TaskID] = {}
+        self.ready_files: Deque[Tuple[int, int]] = deque()
+        self.progress_tasks: Dict[int, TaskID] = {}
 
     def check_dst_path(self):
         '''检查目标路径'''
@@ -417,26 +454,26 @@ class Receiver(Thread):
         '''通知对端文件准备就绪'''
         while self.ready_files:
             if self.concurrency.acquire(False):
-                f_id = self.ready_files[0]
+                f_id, position = self.ready_files[0]
                 f_info = self.files[f_id]
                 # 创建写入迭代器
-                self.iwriters[f_id] = f_info.iwrite()
+                self.iwriters[f_id] = f_info.iwrite(position)
                 self.iwriters[f_id].send(None)
 
                 # 通知对端：文件准备就绪
                 logging.debug(f'[Receiver] File({f_id}) ready')
-                ready_pkt = Packet.load(Flag.FILE_READY, f_id)
+                ready_pkt = Packet.load(Flag.FILE_READY, f_id, position)
                 self.conn_pool.send(ready_pkt)
                 self.ready_files.popleft()
 
                 # 添加进度条任务
-                task_id = trans_progress.add_task(
+                self.progress_tasks[f_id] = trans_progress.add_task(
                     f'download-{f_info.name}',
                     filename=f_info.name,
                     total=f_info.size,
+                    completed=position,
                     start=True
                 )
-                self.trans_progress_tasks[f_id] = task_id
             else:
                 break
 
@@ -450,7 +487,8 @@ class Receiver(Thread):
             f_info.set_parent(self.base_dir)
 
         # 检查文件是否需要传输
-        if f_info.is_vaild():
+        diff_pos = f_info.diff()
+        if diff_pos == -1:
             f_info.set_stat()
             self.n_recv += 1
             logging.info(f'[Receiver] File finished: {f_info.s_relpath}.')
@@ -458,7 +496,8 @@ class Receiver(Thread):
             if f_info.size > 0:
                 self.files[f_info.id] = f_info
                 self.size += f_info.size
-                self.ready_files.append(f_info.id)  # 将 f_id 加入待通知队列
+                # 将 f_id, position 加入待通知队列
+                self.ready_files.append((f_info.id, diff_pos))
                 self.ready_notice()
             else:
                 # 传输的是空文件，直接标记为完成
@@ -466,30 +505,19 @@ class Receiver(Thread):
                 self.n_recv += 1
                 logging.info(f'[Receiver] File finished: {f_info.s_relpath}')
 
-    def get_iwriter(self, f_id):
-        '''获取写入迭代器'''
-        if f_id not in self.iwriters:
-            f_info = self.files[f_id]
-            # 创建并启动写入迭代器
-            self.iwriters[f_id] = f_info.iwrite()
-            self.iwriters[f_id].send(None)
-        return self.iwriters[f_id]
-
     def process_file_chunk(self, packet: Packet):
         '''处理文件数据块'''
         f_id, seq, chunk = packet.unpack_body()
         try:
             logging.debug(f'[Receiver] Write chunk({seq}) '
                           f'into {self.files[f_id].s_relpath}')
-            iwriter = self.get_iwriter(f_id)
-            trans_progress.update(self.trans_progress_tasks[f_id],
-                                  advance=len(chunk))
-            iwriter.send((seq, chunk))
+            self.iwriters[f_id].send((seq, chunk))
+            trans_progress.update(self.progress_tasks[f_id], advance=len(chunk))
         except StopIteration:
             # 释放并发计数器
             self.concurrency.release()
             # 检查文件 Hash
-            if self.files[f_id].is_vaild():
+            if self.files[f_id].diff() == -1:
                 self.files[f_id].set_stat()  # 修改文件状态
                 self.n_recv += 1
                 self.iwriters.pop(f_id)

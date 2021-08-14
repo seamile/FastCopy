@@ -66,12 +66,16 @@ class Packet(NamedTuple):
             length = len(args[-1])
             body = pack(f'>IH{length}s', *args)
         elif flag == Flag.FILE_INFO:
-            length = len(args[-1])
-            body = pack(f'>IHQd16s{length}s', *args)
+            chksum, path = args[-2:]
+            len_chk = len(chksum)
+            n_chksum = len_chk // 16 - 1
+            len_path = len(path)
+            body = pack(f'>IHQdB{len_chk}s{len_path}s',
+                        *args[:-2], n_chksum, chksum, path)
         elif flag == Flag.FILE_COUNT:
             body = pack('>I', *args)
         elif flag == Flag.FILE_READY:
-            body = pack('>I', *args)
+            body = pack('>IQ', *args)
         elif flag == Flag.FILE_CHUNK:
             length = len(args[-1])
             body = pack(f'>2I{length}s', *args)
@@ -115,16 +119,19 @@ class Packet(NamedTuple):
             return unpack(fmt, self.body)
 
         elif self.flag == Flag.FILE_INFO:
-            # file_id | perm | size | mtime | chksum | path
-            #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
-            fmt = f'>IHQd16s{self.length - 38}s'
-            return unpack(fmt, self.body)
+            # file_id | perm | size | mtime | n_chksum | chksum  | path
+            #   4B    |  2B  |  8B  |  8B   |    1B    | n * 16B |  ...
+            part1 = unpack('>IHQdB', self.body[:23])
+            len_chk = (part1[-1] + 1) * 16
+            len_path = self.length - 23 - len_chk
+            part2 = unpack(f'>{len_chk}s{len_path}s', self.body[23:])
+            return part1[:-1] + part2
 
         elif self.flag == Flag.FILE_COUNT:
             return unpack('>I', self.body)  # file count
 
         elif self.flag == Flag.FILE_READY:
-            return unpack('>I', self.body)  # file id
+            return unpack('>IQ', self.body)  # file id
 
         elif self.flag == Flag.FILE_CHUNK:
             # file_id |  seq  | chunk
