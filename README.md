@@ -23,13 +23,21 @@ pip install fastcopy
 
 2. 本地
 
-    ```shell
-    # download
-    fcp user@host:/foo/bar ./
+    - 下载
 
-    # upload
-    fcp ./fake/file user@host:/foo/bar
-    ```
+        ```shell
+        fcp user@host:/foo/bar ./
+        ```
+
+        [![asciicast](https://asciinema.org/a/430555.svg)](https://asciinema.org/a/430555)
+
+    - 上传
+
+        ```shell
+        fcp ./fake/file user@host:/foo/bar
+        ```
+
+        [![asciicast](https://asciinema.org/a/430553.svg)](https://asciinema.org/a/430553)
 
 
 ## TODO
