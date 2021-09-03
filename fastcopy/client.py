@@ -33,10 +33,6 @@ conn_progress = Progress(
     SpinnerColumn(finished_text='✓')
 )
 
-progress_table = Table.grid()
-progress_table.add_row(conn_progress)  # type: ignore
-progress_table.add_row(trans_progress)  # type: ignore
-
 
 def retry(num, *, wait, exceptions=(Exception,)):
     def deco(func):
@@ -80,8 +76,9 @@ class Client:
             #   - self.dst:      dest dir or file
             self.parse_cli_args(args)
         except Exception as e:
-            logging.fatal(f'[b]fcp[/b]: {e}')
-            print('--------------------------------')
+            msg = f'[b]fcp[/b]: {e}'
+            logging.fatal(msg)
+            print('-' * (len(msg) - 7))
             cli_parser.print_help()
             sys.exit(1)
 
@@ -134,9 +131,12 @@ class Client:
 
     def set_log(self):
         '''处理日志'''
+        global print
+        print = partial(conn_progress.print, style='cyan')
+
         logging.root.setLevel(self.log_level)
         if self.log_level <= logging.ERROR:
-            logging.fatal = partial(conn_progress.print, style='magenta')
+            logging.fatal = partial(conn_progress.print, style='bold red')
             logging.error = partial(conn_progress.print, style='red')
         if self.log_level <= logging.WARNING:
             logging.warning = partial(conn_progress.print, style='yellow')
@@ -151,8 +151,11 @@ class Client:
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
         '''加载默认配置'''
         _path = user_config_file or cls.default_config
-        cfg = SSHConfig.from_path(_path)
-        return cfg.lookup(hostname)
+        if os.path.isfile(_path):
+            cfg = SSHConfig.from_path(_path)
+            return cfg.lookup(hostname)
+        else:
+            return {}
 
     @staticmethod
     def load_pkey(key_path):
@@ -201,7 +204,6 @@ class Client:
 
         return pkey_paths
 
-    @retry(3, wait=0.3, exceptions=ConnectionResetError)
     def create_transport(self, sock, user, pkey, password):
         if isinstance(sock, tuple):
             sock = create_connection(sock)
@@ -218,7 +220,7 @@ class Client:
             if 'Connection reset by peer' in str(e):
                 raise ConnectionResetError from e
             else:
-                logging.error(f'[b]fcp[/b]: create transport failed due to {e}')
+                logging.warning(f'[b]fcp[/b]: create transport failed due to {e}')
 
     def create_channel(self, transport: Transport) -> Channel:  # type: ignore
         '''create a new channel by transport'''
@@ -253,24 +255,29 @@ class Client:
 
         # connect to ssh server (just connect, not auth)
         addr = (self.host, self.port)
-        sock = create_connection(addr)
 
         # try the pkeys one by one
         for _path in pkey_paths:
-            logging.debug(f'test pkey: {_path}')
+            logging.info(f'[b]test pkey[/b]: {_path}')
             pkey = self.load_pkey(_path)
-            tp = self.create_transport(sock, self.username, pkey, None)
+            tp = self.create_transport(addr, self.username, pkey, None)
             if tp:
                 self.tunnels[tp] = []
                 return tp, pkey, None
 
         # try to auth with password
         for _ in range(3):
-            password = getpass(f'password for {self.username}@{self.host}: ')
-            tp = self.create_transport(sock, self.username, None, password)
+            password = conn_progress.console.input(
+                f'password for {self.username}@{self.host}:\n',
+                password=True
+            )
+            logging.debug('[b]test password[/b]: %s' % password)
+            tp = self.create_transport(addr, self.username, None, password)
             if tp:
                 self.tunnels[tp] = []
                 return tp, None, password
+            else:
+                print('[b]fcp[/b]: wrong password!', style='red')  # type:ignore
 
         logging.error('[b]fcp[/b]: failed to create SSH tunnel')
         sys.exit(1)
@@ -303,7 +310,7 @@ class Client:
         '''后续连接'''
         addr = (self.host, self.port)
 
-        @retry(3, wait=0.3)
+        @retry(3, wait=0.3, exceptions=ConnectionResetError)
         def _attache():
             tp = self.create_transport(addr, self.username, pkey, password)
             self.create_attached_channels(tp, conn_pool, session_id)
@@ -319,6 +326,10 @@ class Client:
             sleep(0.3)
 
     def start(self):
+        progress_table = Table.grid()
+        progress_table.add_row(conn_progress)
+        progress_table.add_row(trans_progress)
+
         with Live(progress_table, refresh_per_second=10):
             try:
                 tp, pkey, password = self.ssh_connect()
@@ -349,7 +360,7 @@ class Client:
             except Exception as e:
                 logging.fatal(f'[b]fcp[/b]: {e}')
                 if self.log_level == logging.DEBUG:
-                    trans_progress.console.print_exception()
+                    conn_progress.console.print_exception()
                 sys.exit(1)
 
 
