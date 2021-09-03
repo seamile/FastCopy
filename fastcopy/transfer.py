@@ -6,6 +6,7 @@ from glob import has_magic, iglob
 from hashlib import md5
 from math import ceil
 from pathlib import Path
+from pwd import getpwnam
 from queue import Empty
 from threading import Semaphore, Thread
 from typing import Deque, Dict, Generator, Iterable, List, Tuple, Union
@@ -196,11 +197,12 @@ class FileInfo:
 
 
 class Sender(Thread):
-    def __init__(self, sid: bytes, src_paths: List[str], pool_size: int,
-                 include=None, exclude=None):
+    def __init__(self, sid: bytes, username: str, src_paths: List[str],
+                 pool_size: int, include=None, exclude=None):
         super().__init__(daemon=True)
 
         self.sid = sid
+        self.username = username
         self.srcs = src_paths
         self.conn_pool = ConnectionPool(pool_size)
         self.include = include or '*'
@@ -208,11 +210,12 @@ class Sender(Thread):
         self.tree: Dict[int, Union[DirInfo, FileInfo]] = {}
 
     @staticmethod
-    def abspath(path: str):
+    def abspath(username: str, path: str):
         if path.startswith('/'):
             return Path(path)
-        elif path.startswith('~'):
-            return Path(os.path.expanduser(path))
+        elif path.startswith('~/'):
+            userhome = getpwnam(username).pw_dir
+            return Path(f'{userhome}/{path[2:]}')
         elif path.startswith('$'):
             return Path(os.path.expandvars(path))
         else:
@@ -265,10 +268,11 @@ class Sender(Thread):
             logging.warning(f'[Sender] No such file or directory: {fullpath}.')
 
     @classmethod
-    def search_files_and_dirs(cls, path: str, include: str, exclude: list) \
-            -> Generator[Tuple[Path, Path], None, None]:
+    def search_files_and_dirs(cls, username: str, path: str,
+                              include: str, exclude: list
+                              ) -> Generator[Tuple[Path, Path], None, None]:
         '''查找文件与文件夹'''
-        _path = cls.abspath(path)
+        _path = cls.abspath(username, path)
         if has_magic(path):
             for matched_path in iglob(str(_path)):
                 matched = Path(matched_path)
@@ -283,9 +287,8 @@ class Sender(Thread):
         _id = 0
         relpaths = set()
         for src_path in self.srcs:
-            items = self.search_files_and_dirs(src_path,
-                                               self.include,
-                                               self.exclude)
+            items = self.search_files_and_dirs(self.username, src_path,
+                                               self.include, self.exclude)
             for fullpath, relpath in items:
                 if relpath not in relpaths:
                     # 整理目录树
@@ -321,7 +324,7 @@ class Sender(Thread):
         # 通知对端是否是单文件
         is_monofile = (len(self.srcs) == 1
                        and not has_magic(self.srcs[0])
-                       and self.abspath(self.srcs[0]).is_file())
+                       and self.abspath(self.username, self.srcs[0]).is_file())
         mono_pkt = Packet.load(Flag.MONOFILE, is_monofile)
         self.conn_pool.send(mono_pkt)
 
@@ -367,11 +370,12 @@ class Sender(Thread):
 
 
 class Receiver(Thread):
-    def __init__(self, sid: bytes, dst_path: str, pool_size: int) -> None:
+    def __init__(self, sid: bytes, username: str, dst_path: str,
+                 pool_size: int):
         super().__init__(daemon=True)
 
         self.sid = sid
-        self.dst_path = Sender.abspath(dst_path)
+        self.dst_path = Sender.abspath(username, dst_path)
         self.conn_pool = ConnectionPool(pool_size)
 
         self.base_dir = Path.home()

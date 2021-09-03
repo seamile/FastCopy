@@ -101,7 +101,7 @@ class Packet(NamedTuple):
     def unpack_body(self) -> Tuple[Any, ...]:
         '''将 body 解包'''
         if self.flag == Flag.PULL or self.flag == Flag.PUSH:
-            return (self.body.decode('utf-8'),)  # dest path
+            return (self.body.decode('utf-8'),)  # connection info
 
         elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
             return unpack('>16s', self.body)  # Worker ID

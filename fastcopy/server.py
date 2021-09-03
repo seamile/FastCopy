@@ -43,8 +43,8 @@ class WatchDog(Thread):
 
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
             # 创建 Porter
-            path, = packet.unpack_body()
-            porter = self.server.create_porter(packet.flag, path)
+            conn_info, = packet.unpack_body()
+            porter = self.server.create_porter(packet.flag, conn_info)
             porter.conn_pool.add(self.sock)
             porter.start()
 
@@ -74,20 +74,22 @@ class Server(Thread):
         self.mutex = Lock()
         self.porters: Dict[bytes, Porter] = {}
 
-    def create_porter(self, cli_flag: Flag, path: str) -> Porter:
+    def create_porter(self, cli_flag: Flag, conn_info: str) -> Porter:
         '''创建新 Porter'''
         sid = uuid4().bytes
+        _info = loads(conn_info)
+        username = _info['user']
         if cli_flag == Flag.PULL:
-            _path = loads(path)
-            srcs = _path['srcs']
-            include = _path['include']
-            exclude = _path['exclude']
-            logging.debug(f'[Server] New task-{sid.hex()} for send {path}')
-            self.porters[sid] = Sender(sid, srcs, self.max_conn,
+            srcs = _info['srcs']
+            include = _info['include']
+            exclude = _info['exclude']
+            logging.debug(f'[Server] New task-{sid.hex()} for send {srcs}')
+            self.porters[sid] = Sender(sid, username, srcs, self.max_conn,
                                        include, exclude)
         else:
-            logging.debug(f'[Server] New task-{sid.hex()} for recv {path}')
-            self.porters[sid] = Receiver(sid, path, self.max_conn)
+            dst_path = _info['dst']
+            logging.debug(f'[Server] New task-{sid.hex()} for recv {dst_path}')
+            self.porters[sid] = Receiver(sid, username, dst_path, self.max_conn)
         return self.porters[sid]
 
     def close_all_porters(self):

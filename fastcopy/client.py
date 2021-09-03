@@ -9,6 +9,7 @@ from functools import partial, wraps
 from getpass import getpass, getuser
 from json import dumps
 from os.path import abspath
+from pwd import getpwuid
 from socket import create_connection
 from textwrap import dedent
 from threading import Thread
@@ -282,9 +283,9 @@ class Client:
         logging.error('[b]fcp[/b]: failed to create SSH tunnel')
         sys.exit(1)
 
-    def handshake(self, channel, remote_path: str):
+    def handshake(self, channel, conn_info: str):
         '''握手'''
-        conn_pkt = Packet.load(self.action, remote_path)
+        conn_pkt = Packet.load(self.action, conn_info)
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
         session_id, = session_pkt.unpack_body()
@@ -334,19 +335,26 @@ class Client:
             try:
                 tp, pkey, password = self.ssh_connect()
                 first_channel = self.create_channel(tp)
+                local_user = getpwuid(os.getuid()).pw_name
 
                 if self.action == Flag.PULL:
-                    remote_path = dumps({
+                    conn_info = dumps({
+                        'user': self.username,
                         'srcs': self.srcs,
                         'include': self.include,
                         'exclude': self.exclude
                     }, ensure_ascii=False, separators=(',', ':'))
-                    session_id = self.handshake(first_channel, remote_path)
-                    porter = Receiver(session_id, self.dst, self.n_channel)
+                    session_id = self.handshake(first_channel, conn_info)
+                    porter = Receiver(session_id, local_user, self.dst,
+                                      self.n_channel)
                 else:
-                    session_id = self.handshake(first_channel, self.dst)
-                    porter = Sender(session_id, self.srcs, self.n_channel,
-                                    self.include, self.exclude)
+                    conn_info = dumps({
+                        'user': self.username,
+                        'dst': self.dst
+                    })
+                    session_id = self.handshake(first_channel, conn_info)
+                    porter = Sender(session_id, local_user, self.srcs,
+                                    self.n_channel, self.include, self.exclude)
 
                 porter.conn_pool.add(first_channel)
                 porter.start()
