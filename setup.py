@@ -5,7 +5,7 @@ with open("README.md", "r") as f_readme:
 
 setuptools.setup(
     name="fastcopy",
-    version="0.1.6",
+    version="0.1.7",
     python_requires=">=3.6",
     author="Seamile",
     author_email="lanhuermao@gmail.com",
