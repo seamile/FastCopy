@@ -28,6 +28,18 @@ trans_progress = Progress(
 )
 
 
+def handle_finished_task(progress: Progress):
+    tasks = progress.tasks.copy()
+    n_tasks = len(tasks)
+    if n_tasks > 10:
+        for task in tasks:
+            if task.finished:
+                progress.remove_task(task.id)
+                n_tasks -= 1
+                if n_tasks <= 10:
+                    return
+
+
 class DirInfo:
     '''文件夹信息'''
     __slots__ = ('id', 'perm', 'relpath', 'abspath', '_values')
@@ -357,6 +369,7 @@ class Sender(Thread):
                 for chunk_packet in f_info.iread():
                     self.conn_pool.send(chunk_packet)
                     trans_progress.update(task_id, advance=chunk_packet.length)
+                handle_finished_task(trans_progress)
 
             elif packet.flag == Flag.DONE:
                 logging.info('[Sender] All files are processed, exit.')
@@ -488,6 +501,7 @@ class Receiver(Thread):
             iwriter = self.get_iwriter(f_id)
             trans_progress.update(self.trans_progress_tasks[f_id],
                                   advance=len(chunk))
+            handle_finished_task(trans_progress)
             iwriter.send((seq, chunk))
         except StopIteration:
             # 释放并发计数器
