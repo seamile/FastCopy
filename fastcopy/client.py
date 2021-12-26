@@ -205,6 +205,7 @@ class Client:
 
         return pkey_paths
 
+    @retry(3, wait=0.3, exceptions=(ConnectionResetError, EOFError))
     def create_transport(self, sock, user, pkey, password):
         if isinstance(sock, tuple):
             sock = create_connection(sock)
@@ -213,15 +214,19 @@ class Client:
         tp.set_keepalive(60)
         try:
             tp.connect(username=user, pkey=pkey, password=password)
-            if tp.is_authenticated():
-                self.tunnels[tp] = []
-                return tp
         except SSHException as e:
             tp.stop_thread()
             if 'Connection reset by peer' in str(e):
                 raise ConnectionResetError from e
             else:
-                logging.warning(f'[b]fcp[/b]: create transport failed due to {e}')
+                logging.error(f'[b]fcp[/b]: failed to create transport due to {e}')
+                return
+
+        if tp.is_authenticated():
+            self.tunnels[tp] = []
+            return tp
+        else:
+            logging.error('[b]fcp[/b]: failed to create transport due to authentication')
 
     def create_channel(self, transport: Transport) -> Channel:  # type: ignore
         '''create a new channel by transport'''
@@ -314,7 +319,8 @@ class Client:
         @retry(3, wait=0.3, exceptions=ConnectionResetError)
         def _attache():
             tp = self.create_transport(addr, self.username, pkey, password)
-            self.create_attached_channels(tp, conn_pool, session_id)
+            if tp:
+                self.create_attached_channels(tp, conn_pool, session_id)
 
         # create channels from exists transports
         for tp in self.tunnels:

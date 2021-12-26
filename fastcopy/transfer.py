@@ -440,7 +440,7 @@ class Receiver(Thread):
                 self.iwriters[f_id] = f_info.iwrite()
                 self.iwriters[f_id].send(None)
 
-                # 通知对端：文件准备就绪
+                # 通知对端: 文件准备就绪
                 logging.debug(f'[Receiver] File({f_id}) ready')
                 ready_pkt = Packet.load(Flag.FILE_READY, f_id)
                 self.conn_pool.send(ready_pkt)
