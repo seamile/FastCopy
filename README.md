@@ -1,5 +1,8 @@
 # FastCopy
 
+[![PyPI Version](https://img.shields.io/pypi/v/fastcopy?color=blue&label=Version&logo=python&logoColor=white)](https://pypi.org/project/fastcopy/)
+[![Installs](https://static.pepy.tech/personalized-badge/fastcopy?period=total&units=international_system&left_color=grey&right_color=blue&left_text=Installs)](https://pepy.tech/project/fastcopy)
+
 基于 SSH 协议的多线程文件传输工具。
 
 目标是用来替换 `scp` 和 `rsync`。
