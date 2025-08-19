@@ -19,6 +19,9 @@ __pypackages__/
 # mypy
 .mypy_cache/
 
+# uv
+uv.lock
+
 # VSCode
 .vscode/
 *.code-workspace

@@ -1,33 +1,34 @@
 import logging
 from binascii import crc32
 from enum import IntEnum
-from paramiko import Channel
 from queue import Empty, Queue
-from selectors import SelectSelector, EVENT_WRITE
-from socket import socket, error as SocketError
+from selectors import EVENT_WRITE, SelectSelector
+from socket import socket
 from struct import pack, unpack
 from threading import Event, Thread
 from time import sleep
-from typing import Any, NamedTuple, Set, Tuple, Union
+from typing import Any, NamedTuple
 
-from .config import TIMEOUT, LEN_HEAD
+from paramiko import Channel
 
-Connection = Union[socket, Channel]
+from fastcopy.config import LEN_HEAD, TIMEOUT
+
+Connection = socket | Channel
 
 
 class Flag(IntEnum):
-    PUSH = 1         # 推送申请
-    PULL = 2         # 拉取申请
-    SID = 3          # 建立会话
-    ATTACH = 4       # 后续连接
-    MONOFILE = 5     # 传输模式
-    DIR_INFO = 6     # 目录信息
-    FILE_INFO = 7    # 文件信息
-    FILE_COUNT = 8   # 文件数量
-    FILE_READY = 9   # 文件就绪
+    PUSH = 1  # 推送申请
+    PULL = 2  # 拉取申请
+    SID = 3  # 建立会话
+    ATTACH = 4  # 后续连接
+    MONOFILE = 5  # 传输模式
+    DIR_INFO = 6  # 目录信息
+    FILE_INFO = 7  # 文件信息
+    FILE_COUNT = 8  # 文件数量
+    FILE_READY = 9  # 文件就绪
     FILE_CHUNK = 10  # 数据传输
-    DONE = 11        # 完成
-    EXCEPTION = 12   # 异常退出
+    DONE = 11  # 完成
+    EXCEPTION = 12  # 异常退出
 
     @classmethod
     def contains(cls, member: object) -> bool:
@@ -39,9 +40,7 @@ class Packet(NamedTuple):
     body: bytes
 
     def __str__(self) -> str:
-        return (f'Packet: {self.flag.name} '
-                f'len={self.length} '
-                f'chk={self.chksum:08x}')
+        return f'Packet: {self.flag.name} len={self.length} chk={self.chksum:08x}'
 
     @property
     def length(self) -> int:
@@ -52,98 +51,107 @@ class Packet(NamedTuple):
         return crc32(self.body)
 
     @staticmethod
-    def load(flag: Flag, *args) -> 'Packet':
-        '''将包体封包'''
-        if flag == Flag.PULL or flag == Flag.PUSH:
-            if isinstance(args[0], bytes):
-                body = args[0]
-            else:
+    def load(flag: Flag, *args) -> 'Packet':  # noqa: C901
+        """将包体封包"""
+        match flag:
+            case Flag.PULL | Flag.PUSH:
+                body = args[0] if isinstance(args[0], bytes) else str(args[0]).encode('utf8')
+
+            case Flag.SID | Flag.ATTACH:
+                body = pack('>16s', *args)
+
+            case Flag.MONOFILE:
+                body = pack('>?', *args)
+
+            case Flag.DIR_INFO:
+                length = len(args[-1])
+                body = pack(f'>IH{length}s', *args)
+
+            case Flag.FILE_INFO:
+                length = len(args[-1])
+                body = pack(f'>IHQd16s{length}s', *args)
+
+            case Flag.FILE_COUNT:
+                body = pack('>I', *args)
+
+            case Flag.FILE_READY:
+                body = pack('>I', *args)
+
+            case Flag.FILE_CHUNK:
+                length = len(args[-1])
+                body = pack(f'>2I{length}s', *args)
+
+            case Flag.DONE:
+                body = pack('>?', True)
+
+            case Flag.EXCEPTION:
                 body = str(args[0]).encode('utf8')
-        elif flag == Flag.SID or flag == Flag.ATTACH:
-            body = pack('>16s', *args)
-        elif flag == Flag.MONOFILE:
-            body = pack('>?', *args)
-        elif flag == Flag.DIR_INFO:
-            length = len(args[-1])
-            body = pack(f'>IH{length}s', *args)
-        elif flag == Flag.FILE_INFO:
-            length = len(args[-1])
-            body = pack(f'>IHQd16s{length}s', *args)
-        elif flag == Flag.FILE_COUNT:
-            body = pack('>I', *args)
-        elif flag == Flag.FILE_READY:
-            body = pack('>I', *args)
-        elif flag == Flag.FILE_CHUNK:
-            length = len(args[-1])
-            body = pack(f'>2I{length}s', *args)
-        elif flag == Flag.DONE:
-            body = pack('>?', True)
-        elif flag == Flag.EXCEPTION:
-            body = str(args[0]).encode('utf8')
-        else:
-            raise ValueError(f'{flag} is not a valid Flag')
+
+            case _:
+                raise ValueError(f'{flag} is not a valid Flag')
         return Packet(flag, body)
 
     def pack(self) -> bytes:
-        '''封包'''
+        """封包"""
         fmt = f'>BIH{self.length}s'
         return pack(fmt, self.flag, self.chksum, self.length, self.body)
 
     @staticmethod
-    def unpack_head(head: bytes) -> Tuple[Flag, int, int]:
-        '''解析 head'''
+    def unpack_head(head: bytes) -> tuple[Flag, int, int]:
+        """解析 head"""
         flag, chksum, length = unpack('>BIH', head)
         if not Flag.contains(flag):
             raise PacketError
         else:
             return Flag(flag), chksum, length
 
-    def unpack_body(self) -> Tuple[Any, ...]:
-        '''将 body 解包'''
-        if self.flag == Flag.PULL or self.flag == Flag.PUSH:
-            return (self.body.decode('utf-8'),)  # connection info
+    def unpack_body(self) -> tuple[Any, ...]:  # noqa: C901
+        """将 body 解包"""
+        match self.flag:
+            case Flag.PULL | Flag.PUSH:
+                return (self.body.decode('utf-8'),)  # connection info
 
-        elif self.flag == Flag.SID or self.flag == Flag.ATTACH:
-            return unpack('>16s', self.body)  # Worker ID
+            case Flag.SID | Flag.ATTACH:
+                return unpack('>16s', self.body)  # Worker ID
 
-        elif self.flag == Flag.MONOFILE:
-            return unpack('>?', self.body)  # is monofile
+            case Flag.MONOFILE:
+                return unpack('>?', self.body)  # is monofile
 
-        elif self.flag == Flag.DIR_INFO:
-            # file_id | perm | path
-            #   4B    |  2B  |  ...
-            fmt = f'>IH{self.length - 6}s'
-            return unpack(fmt, self.body)
+            case Flag.DIR_INFO:
+                # file_id | perm | path
+                #   4B    |  2B  |  ...
+                fmt = f'>IH{self.length - 6}s'
+                return unpack(fmt, self.body)
 
-        elif self.flag == Flag.FILE_INFO:
-            # file_id | perm | size | mtime | chksum | path
-            #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
-            fmt = f'>IHQd16s{self.length - 38}s'
-            return unpack(fmt, self.body)
+            case Flag.FILE_INFO:
+                # file_id | perm | size | mtime | chksum | path
+                #   4B    |  2B  |  8B  |  8B   |  16B   |  ...
+                fmt = f'>IHQd16s{self.length - 38}s'
+                return unpack(fmt, self.body)
 
-        elif self.flag == Flag.FILE_COUNT:
-            return unpack('>I', self.body)  # file count
+            case Flag.FILE_COUNT:
+                return unpack('>I', self.body)  # file count
 
-        elif self.flag == Flag.FILE_READY:
-            return unpack('>I', self.body)  # file id
+            case Flag.FILE_READY:
+                return unpack('>I', self.body)  # file id
 
-        elif self.flag == Flag.FILE_CHUNK:
-            # file_id |  seq  | chunk
-            #    4B   |  4B   |  ...
-            fmt = f'>2I{self.length - 8}s'
-            return unpack(fmt, self.body)
+            case Flag.FILE_CHUNK:
+                # file_id |  seq  | chunk
+                #    4B   |  4B   |  ...
+                fmt = f'>2I{self.length - 8}s'
+                return unpack(fmt, self.body)
 
-        elif self.flag == Flag.DONE:
-            return unpack('>?', self.body)
+            case Flag.DONE:
+                return unpack('>?', self.body)
 
-        elif self.flag == Flag.EXCEPTION:
-            return (self.body.decode('utf-8'),)
+            case Flag.EXCEPTION:
+                return (self.body.decode('utf-8'),)
 
-        else:
-            raise ValueError(f'{self.flag} is not a valid Flag')
+            case _:
+                raise ValueError(f'{self.flag} is not a valid Flag')
 
     def is_valid(self, chksum: int):
-        '''是否是有效的包体'''
+        """是否是有效的包体"""
         return self.chksum == chksum
 
 
@@ -152,20 +160,20 @@ class PacketError(Exception):
 
 
 def send_pkt(conn: Connection, packet: Packet):
-    '''发送数据报文'''
+    """发送数据报文"""
     datagram = packet.pack()
     conn.sendall(datagram)
 
 
 def recv_all(conn: Connection, length: int) -> bytes:
-    '''接受完整数据'''
+    """接受完整数据"""
     datagram = bytearray()
     while length > 0:
-        _data = conn.recv(length)
-        n_recv = len(_data)
+        rcv_data = conn.recv(length)
+        n_recv = len(rcv_data)
         if n_recv > 0:
             length -= n_recv
-            datagram += _data
+            datagram += rcv_data
         else:
             raise ConnectionResetError
 
@@ -173,7 +181,7 @@ def recv_all(conn: Connection, length: int) -> bytes:
 
 
 def recv_pkt(conn: Connection) -> Packet:
-    '''接收数据报文'''
+    """接收数据报文"""
     # 接收并解析 head 部分
     head = recv_all(conn, LEN_HEAD)
     flag, chksum, len_body = Packet.unpack_head(head)
@@ -197,23 +205,23 @@ class Counter:
 class ConnectionPool(Thread):
     _max_size = 128
 
-    def __init__(self, size=16):
+    def __init__(self, size: int = 16):
         super().__init__(daemon=True)
         self.size = min(size, self._max_size)
-        self.send_q = Queue(self.size)
-        self.recv_q = Queue()
+        self.send_q: Queue = Queue(self.size)
+        self.recv_q: Queue = Queue()
         self.done = Event()
         self.sender = SelectSelector()
-        self.connections: Set[Connection] = set()
+        self.connections: set[Connection] = set()
 
     def send(self, packet: Packet):
         self.send_q.put(packet)
 
     def recv(self, timeout=TIMEOUT) -> Packet:
-        return self.recv_q.get(timeout)
+        return self.recv_q.get(timeout=timeout)
 
     def add(self, conn: Connection):
-        '''添加一个连接'''
+        """添加一个连接"""
         # 检查数量是否达到上限
         if len(self.connections) >= self._max_size:
             return False
@@ -241,7 +249,7 @@ class ConnectionPool(Thread):
         finally:
             conn.close()
 
-    def listen_to_send(self):
+    def listen_to_send(self) -> None:
         while not self.done.is_set():
             # find the conn that sent the least data
             keys = [key for key, _ in self.sender.select(timeout=1)]
@@ -253,7 +261,7 @@ class ConnectionPool(Thread):
             # get data
             try:
                 packet: Packet = self.send_q.get(timeout=TIMEOUT)
-                conn: Connection = key.fileobj
+                conn: Connection = key.fileobj  # type: ignore
             except Empty:
                 break
 
@@ -261,7 +269,7 @@ class ConnectionPool(Thread):
             try:
                 send_pkt(conn, packet)
                 key.data.acc(packet.length)
-            except SocketError as e:
+            except OSError as e:
                 self.pop(conn)
                 logging.warning(f'[Send] Conn-{id(conn):x}: {e}.')
 
@@ -272,10 +280,10 @@ class ConnectionPool(Thread):
                 packet = recv_pkt(conn)
                 self.recv_q.put(packet)
                 logging.debug(f'[Recv] conn-{conn_name}: {packet}')
-            except ConnectionResetError:
+            except ConnectionResetError:  # noqa: PERF203
                 self.pop(conn)
                 return
-            except SocketError as e:
+            except OSError as e:
                 self.pop(conn)
                 logging.warning(f'[Recv] Conn-{conn_name}: {e}.')
             except PacketError:

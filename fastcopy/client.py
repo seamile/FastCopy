@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 
-import os
-import sys
 import logging
+import os
 import signal
+import sys
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from functools import partial, wraps
 from getpass import getpass, getuser
@@ -14,24 +14,31 @@ from socket import create_connection
 from textwrap import dedent
 from threading import Thread
 from time import sleep
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-from paramiko import Channel, Transport, SSHConfig
-from paramiko import RSAKey, DSSKey, ECDSAKey, Ed25519Key
-from paramiko import SSHException, ChannelException, PasswordRequiredException
+from paramiko import (
+    Channel,
+    ChannelException,
+    ECDSAKey,
+    Ed25519Key,
+    PasswordRequiredException,
+    RSAKey,
+    SSHConfig,
+    SSHException,
+    Transport,
+)
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from .config import SERVER_ADDR, SSH_MUX, TIMEOUT
-from .network import Flag, Packet, send_pkt, recv_pkt
-from .transfer import Sender, Receiver, trans_progress
-
+from fastcopy.config import SERVER_ADDR, SSH_MUX, TIMEOUT
+from fastcopy.network import Flag, Packet, recv_pkt, send_pkt
+from fastcopy.transfer import Receiver, Sender, trans_progress
 
 conn_progress = Progress(
-    TextColumn("[bold blue]Connecting "),
-    TextColumn("[progress.percentage]{task.completed}/{task.total} "),
-    SpinnerColumn(finished_text='✓')
+    TextColumn('[bold blue]Connecting '),
+    TextColumn('[progress.percentage]{task.completed}/{task.total} '),
+    SpinnerColumn(finished_text='✓'),
 )
 
 
@@ -42,12 +49,14 @@ def retry(num, *, wait, exceptions=(Exception,)):
             for i in range(num):
                 try:
                     return func(*args, **kwargs)
-                except exceptions as err:
+                except exceptions as err:  # noqa: PERF203
                     if i + 1 == num:
                         raise RuntimeError from err
                     sleep(wait)
                     continue
+
         return wrapper
+
     return deco
 
 
@@ -64,7 +73,7 @@ class Client:
             0: logging.ERROR,
             1: logging.WARNING,
             2: logging.INFO,
-            3: logging.DEBUG
+            3: logging.DEBUG,
         }.get(args.verbose, logging.ERROR)
         self.set_log()
 
@@ -90,15 +99,14 @@ class Client:
         self.exclude = [p for p in args.exclude.split(',') if p]
         self.n_tunnel = args.num
         self.n_channel = self.n_tunnel * SSH_MUX
-        self.conn_tid = conn_progress.add_task('Connecting',
-                                               total=self.n_channel)
+        self.conn_tid = conn_progress.add_task('Connecting', total=self.n_channel)
 
         # the ssh tunnels
-        self.tunnels: Dict[Transport, List[Channel]] = {}
+        self.tunnels: dict[Transport, list[Channel]] = {}
 
     @staticmethod
     def parse_remote_addr(remote):
-        '''解析远程主机登录信息'''
+        """解析远程主机登录信息"""
         netloc, path = remote.split(':')
         user, host = netloc.split('@') if '@' in netloc else ('', netloc)
         return user, host, path
@@ -114,11 +122,10 @@ class Client:
         if len(users) == 1 and len(hosts) == 1:
             return users.pop(), hosts.pop(), sorted(srcs)
         else:
-            raise ValueError('All source args must come from '
-                             'the same machine with same user.')
+            raise ValueError('All source args must come from the same machine with same user.')
 
     def parse_cli_args(self, args):
-        '''解析命令行参数'''
+        """解析命令行参数"""
         if ':' in args.srcs[0]:
             self.username, self.host, self.srcs = self.parse_remote_sources(args.srcs)
             self.action = Flag.PULL
@@ -131,9 +138,9 @@ class Client:
             raise ValueError('The server address is not specified.')
 
     def set_log(self):
-        '''处理日志'''
+        """处理日志"""
         global print
-        print = partial(conn_progress.print, style='cyan')
+        print = partial(conn_progress.print, style='cyan')  # noqa: A001
 
         logging.root.setLevel(self.log_level)
         if self.log_level <= logging.ERROR:
@@ -146,35 +153,30 @@ class Client:
         if self.log_level <= logging.DEBUG:
             logging.debug = partial(conn_progress.print, style='white')
 
-        logging.getLogger("paramiko").setLevel(logging.FATAL)
+        logging.getLogger('paramiko').setLevel(logging.FATAL)
 
     @classmethod
     def load_ssh_config(cls, hostname: str, user_config_file=None) -> dict:
-        '''加载默认配置'''
-        _path = user_config_file or cls.default_config
-        if os.path.isfile(_path):
-            cfg = SSHConfig.from_path(_path)
+        """加载默认配置"""
+        cfg_path = user_config_file or cls.default_config
+        if os.path.isfile(cfg_path):
+            cfg = SSHConfig.from_path(cfg_path)
             return cfg.lookup(hostname)
         else:
             return {}
 
     @staticmethod
     def load_pkey(key_path):
-        '''加载 Key'''
-        _path = os.path.abspath(os.path.expanduser(key_path))
-        if not os.path.isfile(_path):
+        """加载 Key"""
+        pk_path = os.path.abspath(os.path.expanduser(key_path))
+        if not os.path.isfile(pk_path):
             return
 
         # guess key type
-        filename = os.path.basename(_path)
+        filename = os.path.basename(pk_path)
         key_type = filename.split('_')[1] if filename.startswith('id_') else ''
         key_types = ['rsa', 'ed25519', 'dsa', 'ecdsa']
-        key_classes = {
-            'rsa': RSAKey,
-            'ed25519': Ed25519Key,
-            'dsa': DSSKey,
-            'ecdsa': ECDSAKey
-        }
+        key_classes = {'rsa': RSAKey, 'ed25519': Ed25519Key, 'ecdsa': ECDSAKey}
 
         types_to_try = [key_type] if key_type in key_types else key_types
         for _ in range(3):
@@ -189,7 +191,7 @@ class Client:
                     continue
 
     def search_pkeys(self):
-        '''查找可用的私钥'''
+        """查找可用的私钥"""
         if self.pkey_path:
             pkey_paths = [self.pkey_path]
         else:
@@ -229,12 +231,10 @@ class Client:
             logging.error('[b]fcp[/b]: failed to create transport due to authentication')
 
     def create_channel(self, transport: Transport) -> Channel:  # type: ignore
-        '''create a new channel by transport'''
+        """create a new channel by transport"""
         try:
             # create channel
-            channel = transport.open_channel(kind='direct-tcpip',
-                                             dest_addr=SERVER_ADDR,
-                                             src_addr=('localhost', 0))
+            channel = transport.open_channel(kind='direct-tcpip', dest_addr=SERVER_ADDR, src_addr=('localhost', 0))
             channel.settimeout(TIMEOUT)
 
             # add to self.tunnels
@@ -247,8 +247,8 @@ class Client:
             logging.error(f'[b]fcp[/b]: create channel failed due to {e}')
             sys.exit(1)
 
-    def ssh_connect(self) -> Tuple[Transport, Any, Any]:  # type: ignore
-        '''连接 SSH 服务器'''
+    def ssh_connect(self) -> tuple[Transport, Any, Any]:  # type: ignore
+        """连接 SSH 服务器"""
         # 获取 SSH 服务器的连接参数
         self.host = self.config.get('hostname', self.host)
         self.port = self.port or self.config.get('port') or self.default_port
@@ -273,11 +273,8 @@ class Client:
 
         # try to auth with password
         for _ in range(3):
-            password = conn_progress.console.input(
-                f'password for {self.username}@{self.host}:\n',
-                password=True
-            )
-            logging.debug('[b]test password[/b]: %s' % password)
+            password = conn_progress.console.input(f'password for {self.username}@{self.host}:\n', password=True)
+            logging.debug(f'[b]test password[/b]: {password}')
             tp = self.create_transport(addr, self.username, None, password)
             if tp:
                 self.tunnels[tp] = []
@@ -289,11 +286,11 @@ class Client:
         sys.exit(1)
 
     def handshake(self, channel, conn_info: str):
-        '''握手'''
+        """握手"""
         conn_pkt = Packet.load(self.action, conn_info)
         send_pkt(channel, conn_pkt)
         session_pkt = recv_pkt(channel)
-        session_id, = session_pkt.unpack_body()
+        (session_id,) = session_pkt.unpack_body()
         logging.info(f'[b]fcp[/b]: Channel-{id(channel):x} connected')
 
         return session_id
@@ -313,7 +310,7 @@ class Client:
             thr.start()
 
     def attached_connect(self, conn_pool, session_id, pkey, password):
-        '''后续连接'''
+        """后续连接"""
         addr = (self.host, self.port)
 
         @retry(3, wait=0.3, exceptions=ConnectionResetError)
@@ -344,30 +341,23 @@ class Client:
                 local_user = getpwuid(os.getuid()).pw_name
 
                 if self.action == Flag.PULL:
-                    conn_info = dumps({
-                        'user': self.username,
-                        'srcs': self.srcs,
-                        'include': self.include,
-                        'exclude': self.exclude
-                    }, ensure_ascii=False, separators=(',', ':'))
+                    conn_info = dumps(
+                        {'user': self.username, 'srcs': self.srcs, 'include': self.include, 'exclude': self.exclude},
+                        ensure_ascii=False,
+                        separators=(',', ':'),
+                    )
                     session_id = self.handshake(first_channel, conn_info)
-                    porter = Receiver(session_id, local_user, self.dst,
-                                      self.n_channel)
+                    porter = Receiver(session_id, local_user, self.dst, self.n_channel)
                 else:
-                    conn_info = dumps({
-                        'user': self.username,
-                        'dst': self.dst
-                    })
+                    conn_info = dumps({'user': self.username, 'dst': self.dst})
                     session_id = self.handshake(first_channel, conn_info)
-                    porter = Sender(session_id, local_user, self.srcs,
-                                    self.n_channel, self.include, self.exclude)
+                    porter = Sender(session_id, local_user, self.srcs, self.n_channel, self.include, self.exclude)
 
                 porter.conn_pool.add(first_channel)
                 porter.start()
 
                 # create attached connections
-                t = Thread(target=self.attached_connect,
-                           args=(porter.conn_pool, session_id, pkey, password))
+                t = Thread(target=self.attached_connect, args=(porter.conn_pool, session_id, pkey, password))
                 t.start()
 
                 porter.join()
@@ -379,7 +369,7 @@ class Client:
 
 
 def handle_sigint(signum, frame):
-    '''键盘中断事件的处理'''
+    """键盘中断事件的处理"""
     logging.error('[b]fcp[/b]: user canceled.')
     conn_progress.stop()
     trans_progress.stop()
@@ -393,32 +383,29 @@ def main():
     parser = ArgumentParser(
         prog='fcp',
         formatter_class=RawDescriptionHelpFormatter,
-        description=dedent('''
+        description=dedent("""
             PULL : fcp [OPTIONS...] [USER@]HOST:SRC... DST
             PUSH : fcp [OPTIONS...] SRC... [USER@]HOST:DST
-        ''')
+        """),
     )
 
-    parser.add_argument('-p', dest='port', type=int, default=None,
-                        help='The port of SSH server (default: 22)')
+    parser.add_argument('-p', dest='port', type=int, default=None, help='The port of SSH server (default: 22)')
 
-    parser.add_argument('-i', dest='private_key', type=str, default=None,
-                        help='The private key file for SSH')
+    parser.add_argument('-i', dest='private_key', type=str, default=None, help='The private key file for SSH')
 
-    parser.add_argument('-F', dest='ssh_config', type=str, default=None,
-                        help='The config file for SSH (default: ~/.ssh/config)')
+    parser.add_argument(
+        '-F', dest='ssh_config', type=str, default=None, help='The config file for SSH (default: ~/.ssh/config)'
+    )
 
-    parser.add_argument('-n', dest='num', type=int, default=8,
-                        help='Max number of SSH tunnels (default: %(default)s)')
+    parser.add_argument('-n', dest='num', type=int, default=8, help='Max number of SSH tunnels (default: %(default)s)')
 
-    parser.add_argument('-v', dest='verbose', action='count', default=0,
-                        help='Verbose mode (default: disable)')
+    parser.add_argument('-v', dest='verbose', action='count', default=0, help='Verbose mode (default: disable)')
 
-    parser.add_argument('--include', type=str, metavar='PATTERN', default='*',
-                        help='include files matching PATTERN')
+    parser.add_argument('--include', type=str, metavar='PATTERN', default='*', help='include files matching PATTERN')
 
-    parser.add_argument('--exclude', type=str, metavar='PATTERN', default='',
-                        help='exclude files matching PATTERN, split by `,`')
+    parser.add_argument(
+        '--exclude', type=str, metavar='PATTERN', default='', help='exclude files matching PATTERN, split by `,`'
+    )
 
     parser.add_argument(dest='srcs', nargs='+', help='source path')
     parser.add_argument(dest='dst', help='destination path')

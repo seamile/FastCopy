@@ -1,21 +1,19 @@
 #!/usr/bin/env python
 
 import _socket
+import builtins
 import logging
 from argparse import ArgumentParser
 from json import loads
-from socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, SO_REUSEPORT
-from socket import error as SocketError, timeout as TimeoutError
-from socket import socket
+from socket import AF_INET, SO_REUSEADDR, SO_REUSEPORT, SOCK_STREAM, SOL_SOCKET, socket
 from threading import Lock, Thread
-from typing import Dict
 from uuid import uuid4
 
 import daemon
 
-from .config import SERVER_ADDR, TIMEOUT
-from .network import Flag, Packet, send_pkt, recv_pkt
-from .transfer import Sender, Receiver, Porter
+from fastcopy.config import SERVER_ADDR, TIMEOUT
+from fastcopy.network import Flag, Packet, recv_pkt, send_pkt
+from fastcopy.transfer import Porter, Receiver, Sender
 
 
 class WatchDog(Thread):
@@ -27,15 +25,15 @@ class WatchDog(Thread):
     def run(self):
         try:
             # 等待接收新连接的第一个数据报文
-            logging.debug('[WatchDog] waiting for handshake from %s:%d'
-                          % self.sock.getpeername())
+            host, port = self.sock.getpeername()
+            logging.debug(f'[WatchDog] waiting for handshake from {host}:{port:d}')
             self.sock.settimeout(60)
             packet = recv_pkt(self.sock)
             self.sock.settimeout(TIMEOUT)
         except ConnectionResetError:
             logging.error('[WatchDog] connection reset by peer.')
             return
-        except TimeoutError:
+        except builtins.TimeoutError:
             # 超时退出
             logging.error('[WatchDog] handshake timeout.')
             self.sock.close()
@@ -43,7 +41,7 @@ class WatchDog(Thread):
 
         if packet.flag == Flag.PULL or packet.flag == Flag.PUSH:
             # 创建 Porter
-            conn_info, = packet.unpack_body()
+            (conn_info,) = packet.unpack_body()
             porter = self.server.create_porter(packet.flag, conn_info)
             porter.conn_pool.add(self.sock)
             porter.start()
@@ -53,7 +51,7 @@ class WatchDog(Thread):
             send_pkt(self.sock, packet)
 
         elif packet.flag == Flag.ATTACH:
-            sid, = packet.unpack_body()
+            (sid,) = packet.unpack_body()
             if not self.server.porters[sid].conn_pool.add(self.sock):
                 self.sock.close()
 
@@ -72,45 +70,43 @@ class Server(Thread):
         self.max_conn = max_conn  # 一个 Porter 的最大连接数
         self.is_running = True
         self.mutex = Lock()
-        self.porters: Dict[bytes, Porter] = {}
+        self.porters: dict[bytes, Porter] = {}
 
     def create_porter(self, cli_flag: Flag, conn_info: str) -> Porter:
-        '''创建新 Porter'''
+        """创建新 Porter"""
         sid = uuid4().bytes
-        _info = loads(conn_info)
-        username = _info['user']
+        inf = loads(conn_info)
+        username = inf['user']
         if cli_flag == Flag.PULL:
-            srcs = _info['srcs']
-            include = _info['include']
-            exclude = _info['exclude']
+            srcs = inf['srcs']
+            include = inf['include']
+            exclude = inf['exclude']
             logging.debug(f'[Server] New task-{sid.hex()} for send {srcs}')
-            self.porters[sid] = Sender(sid, username, srcs, self.max_conn,
-                                       include, exclude)
+            self.porters[sid] = Sender(sid, username, srcs, self.max_conn, include, exclude)
         else:
-            dst_path = _info['dst']
+            dst_path = inf['dst']
             logging.debug(f'[Server] New task-{sid.hex()} for recv {dst_path}')
             self.porters[sid] = Receiver(sid, username, dst_path, self.max_conn)
         return self.porters[sid]
 
     def close_all_porters(self):
-        '''关闭所有 Porter'''
+        """关闭所有 Porter"""
         logging.debug('[Server] Closing all porters.')
         for porter in self.porters.values():
-            porter.close()
+            porter.close()  # type: ignore
 
     @staticmethod
-    def create_socket_server(address, *, family=AF_INET, backlog=None,
-                             reuse_port=False):
+    def create_socket_server(address, *, family=AF_INET, backlog=None, reuse_port=False):
         """copyed from socket.py"""
-        if reuse_port and not hasattr(_socket, "SO_REUSEPORT"):
-            raise ValueError("SO_REUSEPORT not supported on this platform")
+        if reuse_port and not hasattr(_socket, 'SO_REUSEPORT'):
+            raise ValueError('SO_REUSEPORT not supported on this platform')
 
         sock = socket(family, SOCK_STREAM)
         try:
             if hasattr(_socket, 'SO_REUSEADDR'):
                 try:
                     sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-                except SocketError:
+                except OSError:
                     # Fail later on bind(), for platforms which may not
                     # support this option.
                     pass
@@ -118,28 +114,25 @@ class Server(Thread):
                 sock.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)
             try:
                 sock.bind(address)
-            except SocketError as err:
-                msg = '%s (while attempting to bind on address %r)' % \
-                    (err.strerror, address)
-                raise SocketError(err.errno, msg) from None
+            except OSError as err:
+                msg = f'{err.strerror} (while attempting to bind on address {address})'
+                raise OSError(err.errno, msg) from None
             if backlog is None:
                 sock.listen()
             else:
                 sock.listen(backlog)
             return sock
-        except SocketError:
+        except OSError:
             sock.close()
             raise
 
     def run(self):
-        self.srv_sock = self.create_socket_server(self.addr,
-                                                  backlog=2048,
-                                                  reuse_port=True)
-        logging.info('[Server] Listening to %s:%d' % self.addr)
+        self.srv_sock = self.create_socket_server(self.addr, backlog=2048, reuse_port=True)
+        logging.info(f'[Server] Listening to {self.addr[0]}:{self.addr[1]:d}')
         while self.is_running:
             # wait for new connection
             cli_sock, cli_addr = self.srv_sock.accept()
-            logging.info('[Server] Accept new connection: %s:%s' % cli_addr)
+            logging.info(f'[Server] Accept new connection: {cli_addr[0]}:{cli_addr[1]:d}')
 
             # create a WatchDog for handshake
             dog = WatchDog(self, cli_sock)
@@ -148,24 +141,19 @@ class Server(Thread):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('-d',
-                        dest='daemon',
-                        action='store_true',
-                        help='daemonize the fcp process.')
+    parser.add_argument('-d', dest='daemon', action='store_true', help='daemonize the fcp process.')
 
-    parser.add_argument('-c',
-                        dest='concurrency',
-                        metavar='NUM',
-                        type=int,
-                        default=128,
-                        help='max concurrent connections of one task.')
+    parser.add_argument(
+        '-c', dest='concurrency', metavar='NUM', type=int, default=128, help='max concurrent connections of one task.'
+    )
 
-    parser.add_argument('--loglevel',
-                        metavar='LEVEL',
-                        default='error',
-                        choices=['debug', 'info', 'warning', 'error'],
-                        help=('specify the server verbosity level. '
-                              'Choices: debug | info | warning | error'))
+    parser.add_argument(
+        '--loglevel',
+        metavar='LEVEL',
+        default='error',
+        choices=['debug', 'info', 'warning', 'error'],
+        help=('specify the server verbosity level. Choices: debug | info | warning | error'),
+    )
 
     args = parser.parse_args()
 
@@ -174,17 +162,12 @@ def main():
 
     if args.daemon:
         with daemon.DaemonContext():
-            logging.basicConfig(filename='/tmp/fcpd.log',
-                                level=loglevel,
-                                datefmt='%Y-%m-%d %H:%M:%S',
-                                format=logformat)
+            logging.basicConfig(filename='/tmp/fcpd.log', level=loglevel, datefmt='%Y-%m-%d %H:%M:%S', format=logformat)  # noqa: S108
             server = Server(args.concurrency)
             server.start()
             server.join()
     else:
-        logging.basicConfig(level=loglevel,
-                            datefmt='%Y-%m-%d %H:%M:%S',
-                            format=logformat)
+        logging.basicConfig(level=loglevel, datefmt='%Y-%m-%d %H:%M:%S', format=logformat)
         server = Server(args.concurrency)
         server.start()
         server.join()
