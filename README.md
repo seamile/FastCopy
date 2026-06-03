@@ -3,52 +3,49 @@
 [![PyPI Version](https://img.shields.io/pypi/v/fastcopy?color=blue&label=Version&logo=python&logoColor=white)](https://pypi.org/project/fastcopy/)
 [![Installs](https://static.pepy.tech/personalized-badge/fastcopy?period=total&units=international_system&left_color=grey&right_color=blue&left_text=Installs)](https://pepy.tech/project/fastcopy)
 
-基于 SSH 协议的多线程文件传输工具。
+A multi-threaded file transfer tool over SSH protocol.
 
-目标是用来替换 `scp` 和 `rsync`。
+Aims to replace `scp` and `rsync`.
 
+## Features
 
-## 特点
-
-- 文件切块处理，并行传输，速度更快
-- 支持使用 *文件名通配符* 及 *正则表达式* 来匹配需要传输的文件
-- 自动跳过本地与远程相同内容的文件
-- 自动保持 *发送端* 与 *接收端* 文件权限完全相同
-- 支持 SSH Config
-- 支持 SSH Agent
-
+- File chunking with parallel transfers for faster speeds
+- Supports filename wildcards and regular expressions for file matching
+- Automatically skips files with identical content on local and remote
+- Automatically preserves file permissions between sender and receiver
+- Supports SSH Config
+- Supports SSH Agent
 
 ## TODO
 
-- [ ] 断点续传支持
-- [ ] 改进配置管理方式
-- [ ] 握手时确认会话参数，取消全局变量方式
-- [ ] 版本前后兼容
-- [ ] 编写测试用例
-- [ ] 保持软链接
+- [ ] Resume interrupted transfers
+- [ ] Improve configuration management
+- [ ] Confirm session parameters during handshake, remove global variables
+- [ ] Version forward/backward compatibility
+- [ ] Write tests
+- [ ] Preserve symbolic links
 
+## Installation
 
-## 安装
-
-使用前须在 *服务器* 和 *本地* 同时安装本程序。
+The program must be installed on both the *server* and the *local* machine before use.
 
 ```shell
 pip install fastcopy
 ```
 
-## 使用
+## Usage
 
-1. 服务器
+1. Server
 
-    *运行前首先确保服务端的 7523 端口未被占用*
+    *Ensure port 7523 is not occupied on the server before running*
 
     ```shell
     fcpd -d
     ```
 
-2. 本地
+2. Local
 
-    - 下载
+    - Download
 
         ```shell
         fcp user@host:/foo/bar ./
@@ -56,7 +53,7 @@ pip install fastcopy
 
         [![asciicast](https://asciinema.org/a/430555.svg)](https://asciinema.org/a/430555)
 
-    - 上传
+    - Upload
 
         ```shell
         fcp ./fake/file user@host:/foo/bar
@@ -64,131 +61,128 @@ pip install fastcopy
 
         [![asciicast](https://asciinema.org/a/430553.svg)](https://asciinema.org/a/430553)
 
+## Packet Design
 
-## 报文设计
+All packets use **big-endian byte order**.
 
-所有数据包均采用**大端字节序**
-
-### 1. 报文统一格式
+### 1. Unified Packet Format
 
 |  flag   | chksum  | length  | payload |
-| :-----: | :-----: | :-----: | :-----: |
+|:-------:|:-------:|:-------:|:-------:|
 | 1 Bytes | 4 Bytes | 2 Bytes |   ...   |
 
-### 2. 报文类型
+### 2. Packet Types
 
-1. 推送申请: `0x1`
-2. 拉取申请: `0x2`
-3. 建立会话: `0x3`
-4. 后续连接: `0x4`
-5. 传输模式: `0x5`
-6. 目录信息: `0x6`
-7. 文件信息: `0x7`
-8. 文件数量: `0x8`
-9. 文件就绪: `0x9`
-10. 数据传输: `0xa`
-11. 传输完成: `0xb`
-12. 异常退出: `0xc`
+1. Push request: `0x1`
+2. Pull request: `0x2`
+3. Establish session: `0x3`
+4. Subsequent connection: `0x4`
+5. Transfer mode: `0x5`
+6. Directory info: `0x6`
+7. File info: `0x7`
+8. File count: `0x8`
+9. File ready: `0x9`
+10. Data transfer: `0xa`
+11. Transfer complete: `0xb`
+12. Abnormal exit: `0xc`
 
+### 3. Packet Details
 
-### 3. 报文详情
+1. Data Request
 
-1. 数据请求
+    After the connection is established, the client must first request a *pull* or *push* from the server and pass the *destination path* to the server.
 
-    连接建立后，客户端首先需要向服务器申请 *拉取* 或 *推送*，并将 *目的路径* 传给服务器
-
-    - 拉取、推送的标识由 `flag` 字段决定
-    - 方向: Client -> Server
-    - Payload 格式为:
+    - The direction (pull/push) is determined by the `flag` field
+    - Direction: Client -> Server
+    - Payload format:
 
         | connection info |
-        | :-------------: |
+        |:---------------:|
         |   json string   |
 
-2. 建立会话
+2. Establish Session
 
-    服务器收到第一步的申请后，会产生一个 SessionID，并回传给客户端，客户端需要在自己本地保存
+    Upon receiving the request in step 1, the server generates a SessionID and sends it back to the client. The client saves it locally.
 
-    - 方向: Server -> Client
-    - Payload 格式为:
-
-        | session_id |
-        | :--------: |
-        |  16 Bytes  |
-
-3. 后续连接
-
-    客户端后续与服务器建立的并发连接，第一个报文须告诉服务器 SessionID
-
-    - 方向: Client -> Server
-    - Payload 格式为:
+    - Direction: Server -> Client
+    - Payload format:
 
         | session_id |
-        | :--------: |
+        |:----------:|
         |  16 Bytes  |
 
-4. 文件总量
+3. Subsequent Connections
 
-    连接就绪后，发送端需告知接收端文件总量
+    Concurrent connections established by the client after the initial handshake must send the SessionID as the first packet.
 
-    - Payload 长度 4 字节，所以最大允许传输文件数量为 4,294,967,296
-    - 方向: Sender -> Receiver
-    - Payload 格式:
+    - Direction: Client -> Server
+    - Payload format:
+
+        | session_id |
+        |:----------:|
+        |  16 Bytes  |
+
+4. File Count
+
+    Once the connection is ready, the sender must inform the receiver of the total number of files.
+
+    - Payload length is 4 bytes, so the maximum number of files is 4,294,967,296
+    - Direction: Sender -> Receiver
+    - Payload format:
 
         | n_files |
-        | :-----: |
+        |:-------:|
         | 4 Bytes |
 
-5. 文件信息
+5. File Info
 
-    文件发送发需将每一个文件的信息告知接收端。
-    包括文件的编号、权限、大小、创建时间、修改时间、访问时间、校验和、路径。
-    其中路径为相对路径。
+    The sender must communicate the information of each file to the receiver.
+    This includes file ID, permissions, size, creation time, modification time, access time, checksum, and path.
+    The path is relative.
 
-    - 方向: Sender -> Receiver
-    - Payload 格式:
+    - Direction: Sender -> Receiver
+    - Payload format:
 
-        | file_id |  perm   |  size   |  mtime  |  chksum  | path  |
-        | :-----: | :-----: | :-----: | :-----: | :------: | :---: |
-        | 4 Bytes | 2 Bytes | 8 Bytes | 8 Bytes | 16 Bytes |  ...  |
+        | file_id |  perm   |  size   |  mtime  |  chksum  | path |
+        |:-------:|:-------:|:-------:|:-------:|:--------:|:----:|
+        | 4 Bytes | 2 Bytes | 8 Bytes | 8 Bytes | 16 Bytes | ...  |
 
-6. 接收端文件准备就绪
+6. Receiver File Ready
 
-    接收端收到文件信息后，需将文件信息记录起来，并在本地创建同样大小的空文件
+    After receiving the file info, the receiver records the information and creates an empty file of the same size locally.
 
-    - 方向: Receiver -> Sender
-    - Payload 格式:
+    - Direction: Receiver -> Sender
+    - Payload format:
 
         | file_id |
-        | :-----: |
+        |:-------:|
         | 4 Bytes |
 
-7. 文件数据块传输报文
+7. File Data Chunk Packet
 
-    Chunk Sequence 占用 4 字节，所以支持的单个文件最大为: 4 GB * ChunkSize
+    The chunk sequence field occupies 4 bytes, so the maximum supported file size is: 4 GB * ChunkSize
 
-    - 方向: Sender -> Receiver
-    - Payload 格式:
+    - Direction: Sender -> Receiver
+    - Payload format:
 
-        | file_id |   seq   | data  |
-        | :-----: | :-----: | :---: |
-        | 4 Bytes | 4 Bytes |  ...  |
+        | file_id |   seq   | data |
+        |:-------:|:-------:|:----:|
+        | 4 Bytes | 4 Bytes | ...  |
 
+### 4. Handshake Process
 
-### 4. 握手过程
-
-| 序号 |                  客户端                   |               服务器                |
-| ---- | :---------------------------------------: | :---------------------------------: |
-| 1    |                客户端启动                 |             服务端启动              |
-| 2    |                                           |           等待客户端连接            |
-| 3    |               发起连接请求                |                                     |
-| 4    |                                           |           接收客户端连接            |
-| 5    |                                           |   等待客户端请求 (请求超时则断开)   |
-| 6    |        发送 `PUSH` 或 `PULL` 请求         |                                     |
-| 7    |                                           |           产生 SessionID            |
-| 8    |                                           |       将 SessionID 传回客户端       |
-| 9    |           接收 SessionID 并保存           |                                     |
-| 10   |           循环创建多个并行连接            |                                     |
-| 11   | 新连接携带 SessionID 逐一发送`ATTACH`请求 |                                     |
-| 12   |                                           |         确认 SessionID 无误         |
-| 13   |                                           | 将新连接添加至对应 Session 的连接池 |
+| Step |                      Client                       |                 Server                 |
+|------|:-------------------------------------------------:|:--------------------------------------:|
+| 1    |                   Client starts                   |             Server starts              |
+| 2    |                                                   |           Waiting for client           |
+| 3    |                Initiate connection                |                                        |
+| 4    |                                                   |           Accept connection            |
+| 5    |                                                   | Wait for request (timeout disconnects) |
+| 6    |           Send `PUSH` or `PULL` request           |                                        |
+| 7    |                                                   |           Generate SessionID           |
+| 8    |                                                   |        Send SessionID to client        |
+| 9    |            Receive and save SessionID             |                                        |
+| 10   |       Create multiple parallel connections        |                                        |
+| 11   | Each new connection sends `ATTACH` with SessionID |                                        |
+| 12   |                                                   |       Verify SessionID is valid        |
+| 13   |                                                   |     Add connection to session pool     |
