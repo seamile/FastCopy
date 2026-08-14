@@ -12,6 +12,8 @@ Aims to replace `scp` and `rsync`.
 - File chunking with parallel transfers for faster speeds
 - Supports filename wildcards and regular expressions for file matching
 - Automatically skips files with identical content on local and remote
+- rsync-style delta sync: only transfers the differences of modified files
+- Reliable transfer: per-chunk ACK + retransmission, idle-connection timeout with automatic failover
 - Automatically preserves file permissions between sender and receiver
 - Supports SSH Config
 - Supports SSH Agent
@@ -22,8 +24,9 @@ Aims to replace `scp` and `rsync`.
 - [ ] Improve configuration management
 - [ ] Confirm session parameters during handshake, remove global variables
 - [ ] Version forward/backward compatibility
-- [ ] Write tests
 - [ ] Preserve symbolic links
+- [ ] Replace sum-of-bytes weak checksum with Adler-32 rolling checksum in delta sync
+- [ ] Stream delta sync for files larger than `DELTA_MAX_SIZE` (currently falls back to full transfer)
 
 ## Installation
 
@@ -69,7 +72,7 @@ All packets use **big-endian byte order**.
 
 |  flag   | chksum  | length  | payload |
 |:-------:|:-------:|:-------:|:-------:|
-| 1 Bytes | 4 Bytes | 2 Bytes |   ...   |
+| 1 Bytes | 4 Bytes | 4 Bytes |   ...   |
 
 ### 2. Packet Types
 
@@ -85,6 +88,12 @@ All packets use **big-endian byte order**.
 10. Data transfer: `0xa`
 11. Transfer complete: `0xb`
 12. Abnormal exit: `0xc`
+13. Chunk acknowledgment: `0xd`
+14. File done acknowledgment: `0xe`
+15. Block signature (delta sync): `0xf`
+16. Delta literal: `0x10`
+17. Delta block copy: `0x11`
+18. Delta done: `0x12`
 
 ### 3. Packet Details
 
