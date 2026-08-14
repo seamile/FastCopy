@@ -525,7 +525,12 @@ class Receiver(Thread):
 
         # 等待接收文件信息和数据
         while self.n_recv < self.total:
-            packet = self.conn_pool.recv()
+            try:
+                packet = self.conn_pool.recv()
+            except Empty:
+                logging.debug('[Receiver] recv timeout, continue')
+                continue
+
             if packet.flag == Flag.DIR_INFO:
                 self.process_dir_info(packet)
 

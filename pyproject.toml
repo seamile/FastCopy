@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fastcopy"
 version = "0.1.8"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ name = "Seamile", email = "lanhuermao@gmail.com" }]
 description="A multi-threaded file transfer tool over SSH. The goal is to replace SCP."
 readme = "README.md"
@@ -19,9 +19,9 @@ classifiers = [
     'Topic :: Utilities',
 ]
 dependencies = [
-    "paramiko>=4.0.0",
+    "paramiko>=5.0.0",
     "python-daemon>=3.1.2",
-    "rich>=14.1.0"
+    "rich>=15.0.0",
 ]
 [project.urls]
 homepage = "https://github.com/seamile/FastCopy"
@@ -36,7 +36,5 @@ packages = ["fastcopy"]
 
 [dependency-groups]
 dev = [
-    "ipython>=8.37.0",
-    "mypy>=1.17.1",
-    "types-paramiko>=4.0.0.20250809",
+    "ipython>=9.16.1",
 ]
